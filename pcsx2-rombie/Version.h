@@ -7,6 +7,6 @@
 // "Open Rombie PS2 Engine?" prompt) shows for the exe. Rombie compares the version against the
 // minimum it needs when it connects.
 #define ROMBIE_ENGINE_VERSION_MAJOR 0
-#define ROMBIE_ENGINE_VERSION_MINOR 3
+#define ROMBIE_ENGINE_VERSION_MINOR 4
 #define ROMBIE_ENGINE_VERSION_PATCH 0
-#define ROMBIE_ENGINE_VERSION "0.3.0"
+#define ROMBIE_ENGINE_VERSION "0.4.0"

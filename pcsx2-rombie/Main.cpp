@@ -225,11 +225,13 @@ static void SettingsOverride()
 	// controls. None of PCSX2's own input sources are opened.
 	for (u32 i = 0; i < static_cast<u32>(InputSourceType::Count); i++)
 		si.SetBoolValue("InputSources", InputManager::InputSourceToString(static_cast<InputSourceType>(i)), false);
-	for (u32 port = 0; port < 2; port++)
+	// PCSX2 numbers pads 0 and 1 for the two controller ports and 2-4 for a multitap on port 1. Pads
+	// 2-4 only connect while the page has the tap in (Session.cpp); the tap itself starts out.
+	for (u32 slot = 0; slot < 5; slot++)
 	{
-		const std::string section = fmt::format("Pad{}", port + 1);
+		const std::string section = fmt::format("Pad{}", slot + 1);
 		si.SetStringValue(section.c_str(), "Type", "DualShock2");
-		Pad::ClearPortBindings(si, port);
+		Pad::ClearPortBindings(si, slot);
 	}
 	si.ClearSection("Hotkeys");
 

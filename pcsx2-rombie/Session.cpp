@@ -10,6 +10,7 @@
 #include "pcsx2/CDVD/ThreadedFileReader.h"
 #include "pcsx2/GS/Renderers/Common/GSDevice.h"
 #include "pcsx2/GS/Renderers/Common/GSTexture.h"
+#include "pcsx2/Host.h"
 #include "pcsx2/Host/AudioStream.h"
 #include "pcsx2/MTGS.h"
 #include "pcsx2/PerformanceMetrics.h"
@@ -51,6 +52,7 @@ namespace
 		MSG_LOAD_STATE = 0x07,
 		MSG_MEMORY_CARD = 0x08,
 		MSG_SPEED = 0x09,
+		MSG_MULTITAP = 0x0A,
 
 		MSG_DISC_READ = 0x81,
 		MSG_FRAME = 0x82,
@@ -68,7 +70,11 @@ namespace
 
 	static constexpr u32 FRAME_HEADER_SIZE = 24;
 	static constexpr u32 AUDIO_HEADER_SIZE = 8;
-	static constexpr u32 NUM_PADS = 2;
+	/// Players the page can send input for. Without the multitap only the first two have a pad.
+	static constexpr u32 NUM_PADS = 4;
+	/// PCSX2's pad slot for each player with a multitap on controller port 1: 1A, 1B, 1C, 1D. PCSX2
+	/// numbers port 2's first pad 1, so without the tap the players are simply slots 0 and 1.
+	static constexpr u32 TAP_PAD_SLOTS[NUM_PADS] = {0, 2, 3, 4};
 
 	/// A megabyte of card data with its ECC bytes, as PCSX2 stores a PS2 card. Cards are 8, 16 or 32 of these.
 	static constexpr size_t CARD_MB = 1024 * 528 * 2;
@@ -157,6 +163,8 @@ static std::deque<std::function<void()>> s_work;
 static std::mutex s_pad_mutex;
 static std::array<PadState, NUM_PADS> s_pads;
 static std::array<PadState, NUM_PADS> s_applied_pads; // CPU thread only
+static std::atomic<bool> s_multitap_wanted{false};
+static bool s_multitap_applied = false; // CPU thread only
 
 static std::mutex s_disc_mutex;
 static std::condition_variable s_disc_cv;
@@ -662,6 +670,7 @@ void Session::Begin(WebSocketServer* server)
 		std::unique_lock lock(s_pad_mutex);
 		s_pads = {};
 	}
+	s_multitap_wanted.store(false);
 	{
 		std::unique_lock lock(s_frame_mutex);
 		s_frame_ready = false;
@@ -755,19 +764,41 @@ void Session::RequestQuit()
 	s_boot_cv.notify_all();
 }
 
+/// Plugs the multitap into controller port 1 or takes it out, as the page last asked. PCSX2 treats it
+/// like a settings change: the pads on the port are re-detected by the game.
+static void ApplyMultitap()
+{
+	const bool want = s_multitap_wanted.load();
+	if (want == s_multitap_applied || !VMManager::HasValidVM())
+		return;
+
+	// The players move to other pad slots, so nothing may stay held on the old ones.
+	Pad::ResetAllControllerInputs();
+	s_multitap_applied = want;
+	s_applied_pads = {};
+	EmuConfig.Pad.MultitapPort0_Enabled = want;
+	std::unique_lock<std::mutex> lock = Host::GetSettingsLock();
+	Pad::LoadConfig(*Host::GetSettingsInterface());
+}
+
 void Session::OnVsync()
 {
 	RunPendingWork(false);
+	ApplyMultitap();
 
 	PadState pads[NUM_PADS];
 	{
 		std::unique_lock lock(s_pad_mutex);
 		std::copy(s_pads.begin(), s_pads.end(), pads);
 	}
-	for (u32 port = 0; port < NUM_PADS; port++)
+	for (u32 player = 0; player < NUM_PADS; player++)
 	{
-		const PadState& pad = pads[port];
-		if (pad == s_applied_pads[port])
+		// Players 3 and 4 only have a pad with the multitap in.
+		if (!s_multitap_applied && player >= 2)
+			continue;
+		const u32 port = s_multitap_applied ? TAP_PAD_SLOTS[player] : player;
+		const PadState& pad = pads[player];
+		if (pad == s_applied_pads[player])
 			continue;
 
 		for (u32 bind = PadDualshock2::Inputs::PAD_UP; bind < PadDualshock2::Inputs::PAD_L_UP; bind++)
@@ -782,7 +813,7 @@ void Session::OnVsync()
 		Pad::SetControllerState(port, PadDualshock2::Inputs::PAD_R_DOWN, std::max(ry, 0.0f));
 		Pad::SetControllerState(port, PadDualshock2::Inputs::PAD_R_LEFT, std::max(-rx, 0.0f));
 		Pad::SetControllerState(port, PadDualshock2::Inputs::PAD_R_RIGHT, std::max(rx, 0.0f));
-		s_applied_pads[port] = pad;
+		s_applied_pads[player] = pad;
 	}
 
 	if (s_card_dirty && NowMs() - s_card_written_ms >= CARD_SETTLE_MS)
@@ -811,6 +842,7 @@ void Session::OnVMShuttingDown()
 	});
 	MTGS::WaitGS(false);
 	s_applied_pads = {};
+	s_multitap_applied = false; // the next boot loads settings with the tap out
 	s_frame_no = 0;
 	s_vblank_no.store(0);
 	s_last_grab_ms = 0.0;
@@ -935,6 +967,13 @@ static void HandlePad(std::span<const u8> data)
 	s_pads[port] = pad;
 }
 
+static void HandleMultitap(std::span<const u8> data)
+{
+	if (data.size() < 2)
+		return;
+	s_multitap_wanted.store(data[1] != 0);
+}
+
 static void HandlePing(std::span<const u8> data)
 {
 	if (data.size() < 16)
@@ -990,6 +1029,9 @@ void Session::HandleMessage(std::span<const u8> data, bool is_text)
 			break;
 		case MSG_PAD:
 			HandlePad(data);
+			break;
+		case MSG_MULTITAP:
+			HandleMultitap(data);
 			break;
 		case MSG_PING:
 			HandlePing(data);
