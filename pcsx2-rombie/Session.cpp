@@ -776,8 +776,12 @@ static void ApplyMultitap()
 	Pad::ResetAllControllerInputs();
 	s_multitap_applied = want;
 	s_applied_pads = {};
-	EmuConfig.Pad.MultitapPort0_Enabled = want;
 	std::unique_lock<std::mutex> lock = Host::GetSettingsLock();
+	// PCSX2 reloads EmuConfig from the settings when the game's ELF loads, a few seconds into a boot, so
+	// the tap has to be in the settings too or that reload takes it out again (a page that asked for it
+	// while the screen was still black would get a game with no tap).
+	Host::Internal::GetBaseSettingsLayer()->SetBoolValue("Pad", "MultitapPort1", want);
+	EmuConfig.Pad.MultitapPort0_Enabled = want;
 	Pad::LoadConfig(*Host::GetSettingsInterface());
 }
 
@@ -842,7 +846,12 @@ void Session::OnVMShuttingDown()
 	});
 	MTGS::WaitGS(false);
 	s_applied_pads = {};
-	s_multitap_applied = false; // the next boot loads settings with the tap out
+	// The next boot loads settings with the tap out.
+	s_multitap_applied = false;
+	{
+		std::unique_lock<std::mutex> lock = Host::GetSettingsLock();
+		Host::Internal::GetBaseSettingsLayer()->SetBoolValue("Pad", "MultitapPort1", false);
+	}
 	s_frame_no = 0;
 	s_vblank_no.store(0);
 	s_last_grab_ms = 0.0;
