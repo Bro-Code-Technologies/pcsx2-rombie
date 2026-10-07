@@ -755,32 +755,51 @@ s32 FileMcd_Read(uint port, uint slot, u8* dest, u32 adr, int size)
 	}
 }
 
+static FileMcdWriteNotifier s_write_notifier = nullptr;
+
+void FileMcd_SetWriteNotifier(FileMcdWriteNotifier notifier)
+{
+	s_write_notifier = notifier;
+}
+
 s32 FileMcd_Save(uint port, uint slot, const u8* src, u32 adr, int size)
 {
 	const uint combinedSlot = FileMcd_ConvertToSlot(port, slot);
+	s32 result;
 	switch (EmuConfig.Mcd[combinedSlot].Type)
 	{
 		case MemoryCardType::File:
-			return Mcd::impl.Save(combinedSlot, src, adr, size);
+			result = Mcd::impl.Save(combinedSlot, src, adr, size);
+			break;
 		case MemoryCardType::Folder:
-			return Mcd::implFolder.Save(combinedSlot, src, adr, size);
+			result = Mcd::implFolder.Save(combinedSlot, src, adr, size);
+			break;
 		default:
 			return 0;
 	}
+	if (s_write_notifier)
+		s_write_notifier(port, slot);
+	return result;
 }
 
 s32 FileMcd_EraseBlock(uint port, uint slot, u32 adr)
 {
 	const uint combinedSlot = FileMcd_ConvertToSlot(port, slot);
+	s32 result;
 	switch (EmuConfig.Mcd[combinedSlot].Type)
 	{
 		case MemoryCardType::File:
-			return Mcd::impl.EraseBlock(combinedSlot, adr);
+			result = Mcd::impl.EraseBlock(combinedSlot, adr);
+			break;
 		case MemoryCardType::Folder:
-			return Mcd::implFolder.EraseBlock(combinedSlot, adr);
+			result = Mcd::implFolder.EraseBlock(combinedSlot, adr);
+			break;
 		default:
 			return 0;
 	}
+	if (s_write_notifier)
+		s_write_notifier(port, slot);
+	return result;
 }
 
 u64 FileMcd_GetCRC(uint port, uint slot)

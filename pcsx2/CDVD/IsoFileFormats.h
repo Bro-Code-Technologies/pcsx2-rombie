@@ -75,6 +75,11 @@ public:
 	void BeginRead2(uint lsn);
 	int FinishRead3(u8* dest, uint mode);
 
+	/// Lets a frontend read discs that aren't plain local files (for example, fetched from elsewhere).
+	/// The factory returns a reader for paths it handles and null for everything else.
+	using CustomReaderFactory = std::unique_ptr<ThreadedFileReader> (*)(const std::string& path);
+	static void SetCustomReaderFactory(CustomReaderFactory factory);
+
 protected:
 	void _init();
 

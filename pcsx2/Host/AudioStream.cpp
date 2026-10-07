@@ -27,6 +27,8 @@
 #define LOG_UNDERRUN(...) (void)0
 static constexpr bool LOG_TIMESTRETCH_STATS = false;
 
+static AudioStream::CustomStreamFactory s_custom_stream_factory = nullptr;
+
 static constexpr const std::array<std::pair<u8, u8>, static_cast<size_t>(AudioExpansionMode::Count)>
 	s_expansion_channel_count = {{
 		{u8(2), u8(2)}, // Disabled
@@ -111,6 +113,9 @@ std::unique_ptr<AudioStream> AudioStream::CreateStream(AudioBackend backend, u32
 		GetBackendName(backend), sample_rate, GetExpansionModeName(parameters.expansion_mode), parameters.buffer_ms, parameters.output_latency_ms,
 		stretch_enabled ? "enabled" : "disabled", driver_name, device_name);
 
+	if (s_custom_stream_factory)
+		return s_custom_stream_factory(sample_rate, parameters, stretch_enabled, error);
+
 	switch (backend)
 	{
 		case AudioBackend::Cubeb:
@@ -126,6 +131,11 @@ std::unique_ptr<AudioStream> AudioStream::CreateStream(AudioBackend backend, u32
 			Error::SetStringView(error, "Unknown audio backend.");
 			return nullptr;
 	}
+}
+
+void AudioStream::SetCustomStreamFactory(CustomStreamFactory factory)
+{
+	s_custom_stream_factory = factory;
 }
 
 u32 AudioStream::GetAlignedBufferSize(u32 size)

@@ -422,6 +422,9 @@
     <BuildType Solution="Release|ARM64" Project="Release Clang" />
     <Build Project="false" />
   </Project>
+  <Project Path="pcsx2-rombie/pcsx2-rombie.vcxproj" Id="3cc8d5f4-89e7-4d00-9104-f26e2faddc46">
+    <Build Solution="*|ARM64" Project="false" />
+  </Project>
   <Project Path="pcsx2-qt/pcsx2-qt.vcxproj" Id="2a016f21-87ae-4154-8271-1f57e91408e9">
     <BuildType Solution="Debug AVX2|ARM64" Project="Debug Clang" />
     <BuildType Solution="Debug Clang AVX2|ARM64" Project="Debug Clang" />

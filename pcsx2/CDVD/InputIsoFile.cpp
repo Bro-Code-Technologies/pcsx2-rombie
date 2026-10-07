@@ -37,8 +37,21 @@ static const char* nameFromType(int type)
 	}
 }
 
+static InputIsoFile::CustomReaderFactory s_custom_reader_factory = nullptr;
+
+void InputIsoFile::SetCustomReaderFactory(CustomReaderFactory factory)
+{
+	s_custom_reader_factory = factory;
+}
+
 static std::unique_ptr<ThreadedFileReader> GetFileReader(const std::string& path)
 {
+	if (s_custom_reader_factory)
+	{
+		if (std::unique_ptr<ThreadedFileReader> reader = s_custom_reader_factory(path))
+			return reader;
+	}
+
 	const std::string_view extension = Path::GetExtension(path);
 
 	if (StringUtil::compareNoCase(extension, "chd"))

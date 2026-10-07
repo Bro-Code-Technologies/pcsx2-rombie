@@ -77,12 +77,52 @@ void ReadOSDConfigParames()
 	configParams2.language = configParams1.language;
 }
 
-static bool LoadBiosVersion(std::FILE* fp, u32& version, std::string& description, u32& region, std::string& zone, std::string& serial)
+// An image supplied with SetBIOSImage(), used instead of reading the configured file.
+static std::vector<u8> s_bios_image;
+static std::string s_bios_image_path;
+
+namespace
+{
+	struct FileBiosReader
+	{
+		std::FILE* fp;
+
+		bool Read(void* dst, size_t size) { return std::fread(dst, size, 1, fp) == 1; }
+		bool Seek(s64 pos) { return FileSystem::FSeek64(fp, pos, SEEK_SET) == 0; }
+		s64 Tell() { return FileSystem::FTell64(fp); }
+		s64 Size() { return FileSystem::FSize64(fp); }
+	};
+
+	struct MemoryBiosReader
+	{
+		const std::vector<u8>& data;
+		s64 pos = 0;
+
+		bool Read(void* dst, size_t size)
+		{
+			if (pos < 0 || static_cast<u64>(pos) + size > data.size())
+				return false;
+			std::memcpy(dst, data.data() + pos, size);
+			pos += static_cast<s64>(size);
+			return true;
+		}
+		bool Seek(s64 new_pos)
+		{
+			pos = new_pos;
+			return true;
+		}
+		s64 Tell() { return pos; }
+		s64 Size() { return static_cast<s64>(data.size()); }
+	};
+} // namespace
+
+template <typename Reader>
+static bool LoadBiosVersion(Reader& reader, u32& version, std::string& description, u32& region, std::string& zone, std::string& serial)
 {
 	romdir rd;
 	for (u32 i = 0; i < 512 * 1024; i++)
 	{
-		if (std::fread(&rd, sizeof(rd), 1, fp) != 1)
+		if (!reader.Read(&rd, sizeof(rd)))
 			return false;
 
 		if (std::strncmp(rd.fileName, "RESET", sizeof(rd.fileName)) == 0)
@@ -90,7 +130,7 @@ static bool LoadBiosVersion(std::FILE* fp, u32& version, std::string& descriptio
 	}
 
 	s64 fileOffset = 0;
-	s64 fileSize = FileSystem::FSize64(fp);
+	s64 fileSize = reader.Size();
 	bool foundRomVer = false;
 	char romver[14 + 1] = {}; // ascii version loaded from disk.
 	char extinfo[15 + 1] = {}; // ascii version loaded from disk.
@@ -100,9 +140,8 @@ static bool LoadBiosVersion(std::FILE* fp, u32& version, std::string& descriptio
 	{
 		if (std::strncmp(rd.fileName, "EXTINFO", sizeof(rd.fileName)) == 0)
 		{
-			s64 pos = FileSystem::FTell64(fp);
-			if (FileSystem::FSeek64(fp, fileOffset + 0x10, SEEK_SET) != 0 ||
-				std::fread(extinfo, 15, 1, fp) != 1 || FileSystem::FSeek64(fp, pos, SEEK_SET) != 0)
+			s64 pos = reader.Tell();
+			if (!reader.Seek(fileOffset + 0x10) || !reader.Read(extinfo, 15) || !reader.Seek(pos))
 			{
 				break;
 			}
@@ -112,9 +151,8 @@ static bool LoadBiosVersion(std::FILE* fp, u32& version, std::string& descriptio
 		if (std::strncmp(rd.fileName, "ROMVER", sizeof(rd.fileName)) == 0)
 		{
 
-			s64 pos = FileSystem::FTell64(fp);
-			if (FileSystem::FSeek64(fp, fileOffset, SEEK_SET) != 0 ||
-				std::fread(romver, 14, 1, fp) != 1 || FileSystem::FSeek64(fp, pos, SEEK_SET) != 0)
+			s64 pos = reader.Tell();
+			if (!reader.Seek(fileOffset) || !reader.Read(romver, 14) || !reader.Seek(pos))
 			{
 				break;
 			}
@@ -127,7 +165,7 @@ static bool LoadBiosVersion(std::FILE* fp, u32& version, std::string& descriptio
 		else
 			fileOffset += (rd.fileSize + 0x10) & 0xfffffff0;
 
-		if (std::fread(&rd, sizeof(rd), 1, fp) != 1)
+		if (!reader.Read(&rd, sizeof(rd)))
 			break;
 	}
 
@@ -290,7 +328,14 @@ bool IsBIOS(const char* filename, u32& version, std::string& description, u32& r
 
 	// FPS2BIOS is smaller and of variable size
 	//if (inway.Length() < 512*1024) return false;
-	return LoadBiosVersion(fp.get(), version, description, region, zone, serial);
+	FileBiosReader reader{fp.get()};
+	return LoadBiosVersion(reader, version, description, region, zone, serial);
+}
+
+void SetBIOSImage(std::vector<u8> image, std::string path)
+{
+	s_bios_image = std::move(image);
+	s_bios_image_path = std::move(path);
 }
 
 bool IsBIOSAvailable(const std::string& full_path)
@@ -318,6 +363,22 @@ bool LoadBIOS()
 {
 	pxAssertMsg(eeMem->ROM, "PS2 system memory has not been initialized yet.");
 
+	if (!s_bios_image.empty())
+	{
+		MemoryBiosReader reader{s_bios_image};
+		LoadBiosVersion(reader, BiosVersion, BiosDescription, BiosRegion, BiosZone, BiosSerial);
+
+		const size_t size = s_bios_image.size();
+		BiosRom.assign(s_bios_image.begin(), s_bios_image.begin() + std::min<size_t>(Ps2MemSize::Rom, size));
+		BiosRom.resize(Ps2MemSize::Rom);
+		NoOSD = (size < 2465792);
+
+		BiosChecksum = 0;
+		ChecksumIt(BiosChecksum, 0, Ps2MemSize::Rom);
+		BiosPath = s_bios_image_path;
+		return true;
+	}
+
 	std::string path = EmuConfig.FullpathToBios();
 	if (path.empty() || !FileSystem::FileExists(path.c_str()))
 	{
@@ -340,7 +401,8 @@ bool LoadBIOS()
 	if (filesize <= 0)
 		return false;
 
-	LoadBiosVersion(fp.get(), BiosVersion, BiosDescription, BiosRegion, BiosZone, BiosSerial);
+	FileBiosReader reader{fp.get()};
+	LoadBiosVersion(reader, BiosVersion, BiosDescription, BiosRegion, BiosZone, BiosSerial);
 
 	BiosRom.resize(Ps2MemSize::Rom);
 

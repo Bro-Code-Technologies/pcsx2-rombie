@@ -120,6 +120,11 @@ extern bool IsBIOSAvailable(const std::string& full_path);
 extern bool LoadBIOS();
 extern void CopyBIOSToMemory();
 
+// Makes LoadBIOS() use this image instead of reading a file, for frontends that receive the BIOS
+// rather than finding it on disk. `path` is where the BIOS would live: the NVRAM and MEC files
+// are kept beside it. Pass an empty image to go back to the configured file.
+extern void SetBIOSImage(std::vector<u8> image, std::string path);
+
 // Values in [][0] are the names on BIOSes v1.70 and below.
 // Values in [][1] are the names on BIOSes v1.90 and above.
 // ID 127 ("Seoul" in v01.90 and above) appears to have no corresponding value ("South Korea") on v01.70 and below.

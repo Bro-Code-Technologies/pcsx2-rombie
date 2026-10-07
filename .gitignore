@@ -125,3 +125,6 @@ CMakeSettings.json
 /ci-artifacts/
 /out/
 /.cache/
+
+# Rombie PS2 engine downloads (pcsx2-rombie/package.ps1)
+/dist/

@@ -96,6 +96,12 @@ public:
 		const char* driver_name, const char* device_name, bool stretch_enabled, Error* error = nullptr);
 	static std::unique_ptr<AudioStream> CreateNullStream(u32 sample_rate, u32 buffer_ms);
 
+	/// Lets a frontend that sends audio somewhere other than a local device supply its own stream.
+	/// While set, CreateStream() uses it in place of the configured backend.
+	using CustomStreamFactory = std::unique_ptr<AudioStream> (*)(u32 sample_rate, const AudioStreamParameters& parameters,
+		bool stretch_enabled, Error* error);
+	static void SetCustomStreamFactory(CustomStreamFactory factory);
+
 protected:
 	enum ReadChannel : u8
 	{

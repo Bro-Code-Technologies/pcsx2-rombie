@@ -60,3 +60,8 @@ bool FileMcd_IsMemoryCardFormatted(std::FILE* fp);
 bool FileMcd_CreateNewCard(const std::string_view name, MemoryCardType type, MemoryCardFileType file_type);
 bool FileMcd_RenameCard(const std::string_view name, const std::string_view new_name);
 bool FileMcd_DeleteCard(const std::string_view name);
+
+/// Called after the console writes to or erases part of a card, for a frontend that keeps its own copy
+/// of the card and needs to know when to refresh it.
+using FileMcdWriteNotifier = void (*)(uint port, uint slot);
+void FileMcd_SetWriteNotifier(FileMcdWriteNotifier notifier);
