@@ -67,9 +67,10 @@ static constexpr const wchar_t* PRODUCT_NAME = L"Rombie PS2 Engine";
 // The game's card while it plays, written from the copy Rombie keeps and removed when the game stops.
 static constexpr const char* CARD_FILENAME = "rombie-card.ps2";
 
-// The only pages that may drive the engine: Rombie in production and its local dev server.
-static constexpr std::array<std::string_view, 3> ALLOWED_ORIGINS = {
+// The only pages that may drive the engine: Rombie in production, its staging site and its local dev server.
+static constexpr std::array<std::string_view, 4> ALLOWED_ORIGINS = {
 	"https://rombie.app",
+	"https://staged.rombie.app",
 	"http://localhost:5173",
 	"http://127.0.0.1:5173",
 };
