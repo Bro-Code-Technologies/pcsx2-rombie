@@ -35,6 +35,11 @@ foreach ($dll in 'msvcp140', 'vcruntime140', 'vcruntime140_1') { Copy-Item "$crt
 New-Item -ItemType Directory "$stage\licenses" | Out-Null
 Copy-Item COPYING.GPLv3 "$stage\LICENSE.txt"
 Copy-Item "$Bin\docs\ThirdPartyLicenses.html" "$stage\licenses\"
+# Microsoft's terms for D3D12Core.dll (LICENSE.txt from the Agility SDK 1.619.5 NuGet package the
+# dependency script pins), and SDL3's license, which PCSX2's ThirdPartyLicenses.html leaves out. The
+# MSVC runtime's terms are Visual Studio's, named in the README.
+Copy-Item pcsx2-rombie\licenses\DirectX-Agility-SDK.txt "$stage\licenses\"
+Copy-Item deps\licenses\SDL3\LICENSE.txt "$stage\licenses\SDL3.txt"
 
 $readme = @"
 Rombie PS2 Engine $version
@@ -65,6 +70,15 @@ License
   The engine is free software under the GNU General Public License v3 (LICENSE.txt). It's built
   from PCSX2 (https://pcsx2.net); licenses of the libraries it includes are in licenses\.
   Source code: https://github.com/Bro-Code-Technologies/pcsx2-rombie
+
+Microsoft files
+  D3D12\D3D12Core.dll (the DirectX 12 Agility SDK runtime) and msvcp140.dll, vcruntime140.dll and
+  vcruntime140_1.dll (the Visual C++ runtime) are Microsoft's, distributed with the engine under
+  Microsoft's license terms: licenses\DirectX-Agility-SDK.txt, and the Visual Studio 2022 license
+  terms at https://visualstudio.microsoft.com/license-terms/vs2022-ga-community/. You may use them
+  only as part of the engine, and you may not modify, reverse engineer or distribute them
+  separately. Microsoft provides them as is, without any warranty, and is not liable for any
+  damages arising from them.
 "@
 Set-Content -Path "$stage\README.txt" -Value $readme -Encoding utf8
 
