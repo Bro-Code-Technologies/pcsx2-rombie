@@ -96,6 +96,8 @@ static MemorySettingsInterface s_settings_interface;
 static LaunchMode s_mode = LaunchMode::Setup;
 static u16 s_port = ENGINE_PORT;
 static bool s_once = false;
+// Development only: one more origin a test page may connect from (a page served to another PC on the network).
+static std::string s_dev_origin;
 static std::optional<GSRendererType> s_renderer;
 
 static std::mutex s_key_mutex;
@@ -138,6 +140,9 @@ static std::string GetEngineDataPath()
 	{
 		path = Path::Combine(StringUtil::WideStringToUTF8String(local_app_data), "RombiePS2");
 		CoTaskMemFree(local_app_data);
+		// A second development engine on its own port gets its own folder, so the two never share a card or NVRAM file.
+		if (s_mode == LaunchMode::Dev && s_port != ENGINE_PORT)
+			path += fmt::format("-{}", s_port);
 	}
 	return path;
 }
@@ -307,6 +312,7 @@ static std::string Usage()
 					   "    --port <port>  listen on 127.0.0.1:<port> (default {})\n"
 					   "    --renderer <r> auto, dx11, dx12, vulkan, gl or sw (default auto)\n"
 					   "    --once         exit after the first page instead of waiting for another\n"
+					   "    --origin <o>   also serve pages from origin <o> (a test page on the network)\n"
 					   "  --version        print the version",
 		ROMBIE_ENGINE_VERSION, GIT_REV, ENGINE_PORT);
 }
@@ -377,6 +383,10 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 		{
 			s_once = true;
 		}
+		else if (arg == "--origin" && has_value)
+		{
+			s_dev_origin = argv[++i];
+		}
 		else
 		{
 			ReportError(Usage());
@@ -392,9 +402,12 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 		return false;
 	}
 
-	// The link always uses the one port Rombie knows.
+	// The link always uses the one port Rombie knows, and only Rombie's own origins.
 	if (s_mode != LaunchMode::Dev)
+	{
 		s_port = ENGINE_PORT;
+		s_dev_origin.clear();
+	}
 
 	return true;
 }
@@ -505,7 +518,34 @@ static HandoffResult HandOffKey(u16 port, const std::string& key)
 
 static bool IsAllowedOrigin(std::string_view origin)
 {
-	return std::find(ALLOWED_ORIGINS.begin(), ALLOWED_ORIGINS.end(), origin) != ALLOWED_ORIGINS.end();
+	return std::find(ALLOWED_ORIGINS.begin(), ALLOWED_ORIGINS.end(), origin) != ALLOWED_ORIGINS.end() ||
+		   (!s_dev_origin.empty() && origin == s_dev_origin);
+}
+
+/// Lockstep (netplay): what could differ between two PCs is pinned for this game, and set back after it.
+static void ApplyLockstepSettings(const Session::Lockstep& lockstep, const std::string& bios_path)
+{
+	MemorySettingsInterface& si = s_settings_interface;
+	if (!lockstep.on)
+	{
+		si.DeleteValue("EmuCore", "ManuallySetRealTimeClock");
+		si.DeleteValue("EmuCore/Speedhacks", "vuThread");
+		return;
+	}
+
+	// The console's clock, from the page instead of this PC's.
+	si.SetBoolValue("EmuCore", "ManuallySetRealTimeClock", true);
+	si.SetIntValue("EmuCore", "RtcYear", lockstep.year - 2000);
+	si.SetIntValue("EmuCore", "RtcMonth", lockstep.month);
+	si.SetIntValue("EmuCore", "RtcDay", lockstep.day);
+	si.SetIntValue("EmuCore", "RtcHour", lockstep.hour);
+	si.SetIntValue("EmuCore", "RtcMinute", lockstep.minute);
+	si.SetIntValue("EmuCore", "RtcSecond", lockstep.second);
+	// VU1 on its own thread runs in step with the EE only as host timing allows. Off is PCSX2's default too.
+	si.SetBoolValue("EmuCore/Speedhacks", "vuThread", false);
+	// The BIOS settings (language, time zone) are this PC's own file beside the BIOS; PCSX2's defaults instead.
+	FileSystem::DeleteFilePath(Path::ReplaceExtension(bios_path, "nvm").c_str());
+	FileSystem::DeleteFilePath(Path::ReplaceExtension(bios_path, "mec").c_str());
 }
 
 static void MarkIdle(std::chrono::seconds limit)
@@ -580,7 +620,10 @@ static void SetVMRunning(bool running)
 static void RunGame(Session::BootRequest& boot)
 {
 	// The BIOS stays in memory; PCSX2 only keeps its small NVRAM/MEC settings files beside this path.
-	SetBIOSImage(std::move(boot.bios), Path::Combine(EmuFolders::Bios, "rombie-bios.bin"));
+	const std::string bios_path = Path::Combine(EmuFolders::Bios, "rombie-bios.bin");
+	ApplyLockstepSettings(boot.lockstep, bios_path);
+	Session::BeginGame(boot.lockstep);
+	SetBIOSImage(std::move(boot.bios), bios_path);
 
 	// PCSX2 boots from a path. This empty placeholder satisfies its checks; the reads themselves go
 	// to the page through the custom disc reader.
@@ -611,9 +654,12 @@ static void RunGame(Session::BootRequest& boot)
 		return;
 	}
 
-	Session::SendEvent("booted", fmt::format("serial={} renderer={} title={}", VMManager::GetDiscSerial(),
-									 Pcsx2Config::GSOptions::GetRendererName(GSGetCurrentRenderer()), VMManager::GetTitle(true)));
+	Session::SendEvent("booted", fmt::format("serial={} renderer={} lockstep={} title={}", VMManager::GetDiscSerial(),
+									 Pcsx2Config::GSOptions::GetRendererName(GSGetCurrentRenderer()), boot.lockstep.on ? 1 : 0,
+									 VMManager::GetTitle(true)));
 
+	if (boot.lockstep.unthrottled)
+		VMManager::SetLimiterMode(LimiterModeType::Unlimited);
 	VMManager::SetState(VMState::Running);
 	for (;;)
 	{

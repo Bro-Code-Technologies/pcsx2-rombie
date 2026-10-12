@@ -13,11 +13,16 @@
 #include "pcsx2/Host.h"
 #include "pcsx2/Host/AudioStream.h"
 #include "pcsx2/MTGS.h"
+#include "pcsx2/Memory.h"
 #include "pcsx2/PerformanceMetrics.h"
+#include "pcsx2/R3000A.h"
+#include "pcsx2/R5900.h"
 #include "pcsx2/SIO/Memcard/MemoryCardFile.h"
 #include "pcsx2/SIO/Pad/Pad.h"
 #include "pcsx2/SIO/Pad/PadDualshock2.h"
 #include "pcsx2/VMManager.h"
+#include "pcsx2/VU.h"
+#include "pcsx2/VUmicro.h"
 
 #include "common/Console.h"
 #include "common/Error.h"
@@ -28,12 +33,19 @@
 
 #include "fmt/format.h"
 
+#ifndef XXH_versionNumber
+#define XXH_STATIC_LINKING_ONLY 1
+#define XXH_INLINE_ALL 1
+#include <xxhash.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -53,12 +65,21 @@ namespace
 		MSG_MEMORY_CARD = 0x08,
 		MSG_SPEED = 0x09,
 		MSG_MULTITAP = 0x0A,
+		MSG_LOCKSTEP = 0x0B,
+		MSG_INPUTS = 0x0C,
 
 		MSG_DISC_READ = 0x81,
 		MSG_FRAME = 0x82,
 		MSG_AUDIO = 0x83,
 		MSG_STATE = 0x84,
 		MSG_MEMORY_CARD_SAVED = 0x85,
+		MSG_HASHES = 0x86,
+	};
+
+	enum : u8
+	{
+		LOCKSTEP_ON = 1,
+		LOCKSTEP_UNTHROTTLED = 2,
 	};
 
 	enum : u8
@@ -84,6 +105,9 @@ namespace
 	/// would only load the page, which shows the newest anyway.
 	static constexpr double FAST_FORWARD_FRAME_INTERVAL_MS = 1000.0 / 60.0 - 2.0;
 	static constexpr float MAX_SPEED = 10.0f;
+	/// One player's input in a 0x0C message: u32 buttons and four f32 axes.
+	static constexpr u32 INPUT_PAD_BYTES = 20;
+	static constexpr u32 INPUT_FRAME_BYTES = INPUT_PAD_BYTES * 4;
 
 	struct PadState
 	{
@@ -163,6 +187,12 @@ static std::deque<std::function<void()>> s_work;
 static std::mutex s_pad_mutex;
 static std::array<PadState, NUM_PADS> s_pads;
 static std::array<PadState, NUM_PADS> s_applied_pads; // CPU thread only
+// Lockstep: each vsync's input, by vsync, as the page sent it (s_pad_mutex).
+static std::condition_variable s_inputs_cv;
+static std::map<u32, std::array<PadState, NUM_PADS>> s_inputs;
+static Session::Lockstep s_boot_lockstep; // s_boot_mutex: the 0x0B that came before the boot message
+static Session::Lockstep s_lockstep; // CPU thread: the running game's
+static u32 s_lockstep_vsync = 0; // CPU thread: the next vsync to run
 static std::atomic<bool> s_multitap_wanted{false};
 static bool s_multitap_applied = false; // CPU thread only
 
@@ -669,6 +699,7 @@ void Session::Begin(WebSocketServer* server)
 	{
 		std::unique_lock lock(s_pad_mutex);
 		s_pads = {};
+		s_inputs.clear();
 	}
 	s_multitap_wanted.store(false);
 	{
@@ -696,7 +727,10 @@ void Session::End()
 		s_boot.reset();
 		s_boot_card.clear();
 		s_boot_card_ok = true;
+		s_boot_lockstep = {};
 	}
+	// A vsync waiting for this page's input stops waiting.
+	s_inputs_cv.notify_all();
 
 	{
 		std::unique_lock lock(s_frame_mutex);
@@ -785,12 +819,99 @@ static void ApplyMultitap()
 	Pad::LoadConfig(*Host::GetSettingsInterface());
 }
 
+void Session::BeginGame(const Lockstep& lockstep)
+{
+	s_lockstep = lockstep;
+	s_lockstep_vsync = 0;
+
+	// PCSX2 resets the VUs' registers for a new game but not their memory, so an engine that ran another game
+	// first starts with its leftovers. In lockstep every engine starts from zeros, as a freshly started one does.
+	if (lockstep.on && vuRegs[0].Mem && vuRegs[1].Mem)
+	{
+		std::memset(vuRegs[0].Mem, 0, VU0_MEMSIZE);
+		std::memset(vuRegs[0].Micro, 0, VU0_PROGSIZE);
+		std::memset(vuRegs[1].Mem, 0, VU1_MEMSIZE);
+		std::memset(vuRegs[1].Micro, 0, VU1_PROGSIZE);
+	}
+}
+
+static u64 HashChain(u64 seed, const void* data, size_t size)
+{
+	return XXH3_64bits_withSeed(data, size, seed);
+}
+
+/// CPU thread, at the start of a vsync: hashes of the state two PCs in lockstep must share.
+static void SendStateHashes(u32 vsync)
+{
+	const auto regs_until = [](const void* first, const void* end) {
+		return static_cast<size_t>(static_cast<const u8*>(end) - static_cast<const u8*>(first));
+	};
+	const auto vu = [](const VURegs& regs, u32 mem_size, u32 prog_size) {
+		u64 h = HashChain(0, regs.Mem, mem_size);
+		h = HashChain(h, regs.Micro, prog_size);
+		return HashChain(h, &regs.VF[0], reinterpret_cast<const u8*>(&regs.ACC) + sizeof(regs.ACC) - reinterpret_cast<const u8*>(&regs.VF[0]));
+	};
+
+	const std::array<u64, 10> hashes = {
+		HashChain(0, eeMem->Main, Ps2MemSize::ExposedRam),
+		HashChain(0, eeMem->Scratch, Ps2MemSize::Scratch),
+		// GPR through pc, then the cycle count.
+		HashChain(HashChain(0, &cpuRegs.GPR, regs_until(&cpuRegs.GPR, &cpuRegs.code)), &cpuRegs.cycle, sizeof(cpuRegs.cycle)),
+		HashChain(0, &fpuRegs, sizeof(fpuRegs)),
+		HashChain(0, iopMem->Main, Ps2MemSize::ExposedIopRam),
+		HashChain(HashChain(0, &psxRegs.GPR, regs_until(&psxRegs.GPR, &psxRegs.code)), &psxRegs.cycle, sizeof(psxRegs.cycle)),
+		vu(vuRegs[0], VU0_MEMSIZE, VU0_PROGSIZE),
+		vu(vuRegs[1], VU1_MEMSIZE, VU1_PROGSIZE),
+		HashChain(0, eeHw, Ps2MemSize::Hardware),
+		HashChain(0, iopHw, Ps2MemSize::IopHardware),
+	};
+
+	u8 header[12] = {MSG_HASHES};
+	const u32 count = static_cast<u32>(hashes.size());
+	std::memcpy(&header[4], &vsync, sizeof(vsync));
+	std::memcpy(&header[8], &count, sizeof(count));
+	SendBinary({std::span<const u8>(header), std::span<const u8>(reinterpret_cast<const u8*>(hashes.data()), sizeof(hashes))});
+}
+
+/// CPU thread: waits for the page's input for this vsync. False if the page has gone or the game is stopping.
+static bool WaitForInputs(u32 vsync, PadState* pads)
+{
+	std::unique_lock lock(s_pad_mutex);
+	for (;;)
+	{
+		const auto it = s_inputs.find(vsync);
+		if (it != s_inputs.end())
+		{
+			std::copy(it->second.begin(), it->second.end(), pads);
+			s_inputs.erase(s_inputs.begin(), std::next(it));
+			return true;
+		}
+		if (!s_active.load() || VMManager::GetState() == VMState::Stopping)
+			return false;
+
+		// Work queued for this thread (a stop, a save) still runs while it waits.
+		lock.unlock();
+		Session::RunPendingWork(false);
+		lock.lock();
+		s_inputs_cv.wait_for(lock, std::chrono::milliseconds(2));
+	}
+}
+
 void Session::OnVsync()
 {
 	RunPendingWork(false);
 	ApplyMultitap();
 
 	PadState pads[NUM_PADS];
+	if (s_lockstep.on)
+	{
+		const u32 vsync = s_lockstep_vsync++;
+		if (s_lockstep.hash_every != 0 && vsync % s_lockstep.hash_every == 0)
+			SendStateHashes(vsync);
+		if (!WaitForInputs(vsync, pads))
+			return;
+	}
+	else
 	{
 		std::unique_lock lock(s_pad_mutex);
 		std::copy(s_pads.begin(), s_pads.end(), pads);
@@ -855,6 +976,12 @@ void Session::OnVMShuttingDown()
 	s_frame_no = 0;
 	s_vblank_no.store(0);
 	s_last_grab_ms = 0.0;
+	s_lockstep = {};
+	s_lockstep_vsync = 0;
+	{
+		std::unique_lock lock(s_pad_mutex);
+		s_inputs.clear();
+	}
 }
 
 static void HandleBoot(std::span<const u8> data)
@@ -881,6 +1008,8 @@ static void HandleBoot(std::span<const u8> data)
 		request.memory_card = std::move(s_boot_card);
 		s_boot_card.clear();
 		s_boot_card_ok = true;
+		request.lockstep = s_boot_lockstep;
+		s_boot_lockstep = {};
 		if (!card_ok)
 		{
 			// Booting with a new card instead would hand that back as the game's save, replacing the real one.
@@ -914,6 +1043,61 @@ static void HandleMemoryCard(std::span<const u8> data)
 	s_boot_card_ok = ok;
 }
 
+static void HandleLockstep(std::span<const u8> data)
+{
+	if (data.size() < 16)
+		return;
+
+	Session::Lockstep lockstep;
+	lockstep.on = (data[1] & LOCKSTEP_ON) != 0;
+	lockstep.unthrottled = (data[1] & LOCKSTEP_UNTHROTTLED) != 0;
+	lockstep.hash_every = ReadValue<u32>(data, 4);
+	lockstep.year = ReadValue<u16>(data, 8);
+	lockstep.month = data[10];
+	lockstep.day = data[11];
+	lockstep.hour = data[12];
+	lockstep.minute = data[13];
+	lockstep.second = data[14];
+	// PCSX2 keeps the clock as years since 2000.
+	if (lockstep.year < 2000 || lockstep.year > 2099 || lockstep.month < 1 || lockstep.month > 12 || lockstep.day < 1 ||
+		lockstep.day > 31 || lockstep.hour > 23 || lockstep.minute > 59 || lockstep.second > 59)
+	{
+		Session::SendEvent("error", "The lockstep message's clock is out of range.");
+		return;
+	}
+
+	std::unique_lock lock(s_boot_mutex);
+	s_boot_lockstep = lockstep;
+}
+
+static void HandleInputs(std::span<const u8> data)
+{
+	if (data.size() < 12)
+		return;
+
+	const u32 first = ReadValue<u32>(data, 4);
+	const u32 count = ReadValue<u32>(data, 8);
+	if (count == 0 || data.size() < 12 + static_cast<size_t>(count) * INPUT_FRAME_BYTES)
+		return;
+
+	{
+		std::unique_lock lock(s_pad_mutex);
+		for (u32 frame = 0; frame < count; frame++)
+		{
+			std::array<PadState, NUM_PADS> pads;
+			for (u32 player = 0; player < NUM_PADS; player++)
+			{
+				const size_t at = 12 + static_cast<size_t>(frame) * INPUT_FRAME_BYTES + player * INPUT_PAD_BYTES;
+				pads[player].buttons = ReadValue<u32>(data, at);
+				for (u32 i = 0; i < 4; i++)
+					pads[player].axes[i] = std::clamp(ReadValue<float>(data, at + 4 + i * 4), -1.0f, 1.0f);
+			}
+			s_inputs[first + frame] = pads;
+		}
+	}
+	s_inputs_cv.notify_all();
+}
+
 static void HandleSpeed(std::span<const u8> data)
 {
 	if (data.size() < 8)
@@ -923,7 +1107,8 @@ static void HandleSpeed(std::span<const u8> data)
 	const bool fast = ratio > 1.0f; // false for NaN too
 	const float scalar = fast ? std::min(ratio, MAX_SPEED) : 1.0f;
 	Session::QueueOnCPUThread([fast, scalar]() {
-		if (!VMManager::HasValidVM())
+		// In lockstep the page's input sets the pace.
+		if (!VMManager::HasValidVM() || s_lockstep.on)
 			return;
 		if (!fast)
 		{
@@ -1086,6 +1271,12 @@ void Session::HandleMessage(std::span<const u8> data, bool is_text)
 			break;
 		case MSG_SPEED:
 			HandleSpeed(data);
+			break;
+		case MSG_LOCKSTEP:
+			HandleLockstep(data);
+			break;
+		case MSG_INPUTS:
+			HandleInputs(data);
 			break;
 		default:
 			break;
