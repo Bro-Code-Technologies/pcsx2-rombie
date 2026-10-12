@@ -67,6 +67,7 @@ namespace
 		MSG_MULTITAP = 0x0A,
 		MSG_LOCKSTEP = 0x0B,
 		MSG_INPUTS = 0x0C,
+		MSG_NETPLAY = 0x0D,
 
 		MSG_DISC_READ = 0x81,
 		MSG_FRAME = 0x82,
@@ -74,12 +75,20 @@ namespace
 		MSG_STATE = 0x84,
 		MSG_MEMORY_CARD_SAVED = 0x85,
 		MSG_HASHES = 0x86,
+		MSG_VSYNC = 0x87,
 	};
 
 	enum : u8
 	{
 		LOCKSTEP_ON = 1,
 		LOCKSTEP_UNTHROTTLED = 2,
+	};
+
+	enum : u8
+	{
+		NETPLAY_HOST = 1,
+		NETPLAY_JOIN = 2,
+		NETPLAY_END = 3,
 	};
 
 	enum : u8
@@ -142,6 +151,7 @@ namespace
 		std::atomic<u64> readback_max_us{0};
 		std::atomic<u64> send_us{0};
 		std::atomic<u64> send_max_us{0};
+		std::atomic<u64> lockstep_wait_us{0};
 		std::atomic<u32> width{0};
 		std::atomic<u32> height{0};
 	};
@@ -183,6 +193,8 @@ static bool s_quit = false;
 static std::mutex s_work_mutex;
 static std::condition_variable s_work_cv;
 static std::deque<std::function<void()>> s_work;
+// Netplay's work (s_work_mutex): run only at a vsync, so every PC does it at the same point of the game.
+static std::deque<std::function<void()>> s_vsync_work;
 
 static std::mutex s_pad_mutex;
 static std::array<PadState, NUM_PADS> s_pads;
@@ -193,6 +205,9 @@ static std::map<u32, std::array<PadState, NUM_PADS>> s_inputs;
 static Session::Lockstep s_boot_lockstep; // s_boot_mutex: the 0x0B that came before the boot message
 static Session::Lockstep s_lockstep; // CPU thread: the running game's
 static u32 s_lockstep_vsync = 0; // CPU thread: the next vsync to run
+// CPU thread: set every pad at the next vsync, whatever was applied last. Netplay starts from a loaded state, whose
+// pads are the host's, not what this PC last applied.
+static bool s_force_pads = false;
 static std::atomic<bool> s_multitap_wanted{false};
 static bool s_multitap_applied = false; // CPU thread only
 
@@ -637,15 +652,16 @@ static std::string TakeStatsJson(double window_ms)
 	const u64 rb_max_us = take(s_stats.readback_max_us);
 	const u64 send_us = take(s_stats.send_us);
 	const u64 send_max_us = take(s_stats.send_max_us);
+	const u64 lockstep_wait_us = take(s_stats.lockstep_wait_us);
 
 	return fmt::format(R"({{"t":"stats","ms":{:.0f},"vbl":{},"grab":{},"sent":{},"drop":{},"w":{},"h":{},)"
 					   R"("rb":{:.2f},"rbMax":{:.2f},"send":{:.2f},"sendMax":{:.2f},"af":{},"au":{},)"
-					   R"("dr":{},"drBytes":{},"drMs":{:.2f},"drMax":{:.2f},"cpu":{:.0f},"gs":{:.0f},"speed":{:.1f}}})",
+					   R"("dr":{},"drBytes":{},"drMs":{:.2f},"drMax":{:.2f},"cpu":{:.0f},"gs":{:.0f},"speed":{:.1f},"lw":{:.0f}}})",
 		window_ms, vbl, grabbed, sent, dropped, s_stats.width.load(), s_stats.height.load(),
 		grabbed ? rb_us / 1000.0 / grabbed : 0.0, rb_max_us / 1000.0, sent ? send_us / 1000.0 / sent : 0.0,
 		send_max_us / 1000.0, audio, underruns, reads, read_bytes, reads ? read_us / 1000.0 / reads : 0.0,
 		read_max_us / 1000.0, PerformanceMetrics::GetCPUThreadUsage(), PerformanceMetrics::GetGSThreadUsage(),
-		PerformanceMetrics::GetSpeed());
+		PerformanceMetrics::GetSpeed(), lockstep_wait_us / 1000.0);
 }
 
 static void SenderThread()
@@ -767,6 +783,20 @@ bool Session::RunPendingWork(bool wait)
 	return s_active.load();
 }
 
+/// CPU thread, at a vsync only (never while paused): netplay's work.
+static void RunVsyncWork()
+{
+	std::unique_lock lock(s_work_mutex);
+	while (!s_vsync_work.empty())
+	{
+		std::function<void()> work = std::move(s_vsync_work.front());
+		s_vsync_work.pop_front();
+		lock.unlock();
+		work();
+		lock.lock();
+	}
+}
+
 bool Session::WaitForBoot(BootRequest* request)
 {
 	for (;;)
@@ -823,6 +853,12 @@ void Session::BeginGame(const Lockstep& lockstep)
 {
 	s_lockstep = lockstep;
 	s_lockstep_vsync = 0;
+	s_force_pads = false;
+	{
+		// Netplay work from before this boot was for another game.
+		std::unique_lock lock(s_work_mutex);
+		s_vsync_work.clear();
+	}
 
 	// PCSX2 resets the VUs' registers for a new game but not their memory, so an engine that ran another game
 	// first starts with its leftovers. In lockstep every engine starts from zeros, as a freshly started one does.
@@ -873,49 +909,82 @@ static void SendStateHashes(u32 vsync)
 	SendBinary({std::span<const u8>(header), std::span<const u8>(reinterpret_cast<const u8*>(hashes.data()), sizeof(hashes))});
 }
 
-/// CPU thread: waits for the page's input for this vsync. False if the page has gone or the game is stopping.
-static bool WaitForInputs(u32 vsync, PadState* pads)
+static void SendVsync(u32 vsync)
 {
-	std::unique_lock lock(s_pad_mutex);
+	u8 message[8] = {MSG_VSYNC};
+	std::memcpy(&message[4], &vsync, sizeof(vsync));
+	SendBinary({std::span<const u8>(message)});
+}
+
+/// CPU thread: this vsync's lockstep input, once the page has sent it. The vsync is announced first (0x87, and its
+/// hashes when due), and again if netplay starts over meanwhile. False if the page has gone, the game is stopping, or
+/// netplay has ended.
+static bool LockstepInputs(PadState* pads)
+{
+	// The wait counts as it goes, so a vsync still waiting shows in the stats, not only once its input is in: the
+	// page tells a PC that is slow from one waiting on the others by it.
+	Common::Timer::Value counted = Common::Timer::GetCurrentValue();
+	const auto count_wait = [&counted]() {
+		const Common::Timer::Value now = Common::Timer::GetCurrentValue();
+		s_stats.lockstep_wait_us.fetch_add(static_cast<u64>(Common::Timer::ConvertValueToMilliseconds(now - counted) * 1000.0),
+			std::memory_order_relaxed);
+		counted = now;
+	};
+	bool announced = false;
+	u32 vsync = 0;
 	for (;;)
 	{
-		const auto it = s_inputs.find(vsync);
-		if (it != s_inputs.end())
+		if (!announced || vsync != s_lockstep_vsync)
 		{
-			std::copy(it->second.begin(), it->second.end(), pads);
-			s_inputs.erase(s_inputs.begin(), std::next(it));
-			return true;
+			announced = true;
+			vsync = s_lockstep_vsync;
+			if (s_lockstep.hash_every != 0 && vsync % s_lockstep.hash_every == 0)
+				SendStateHashes(vsync);
+			SendVsync(vsync);
 		}
-		if (!s_active.load() || VMManager::GetState() == VMState::Stopping)
-			return false;
+		{
+			std::unique_lock lock(s_pad_mutex);
+			const auto it = s_inputs.find(vsync);
+			if (it != s_inputs.end())
+			{
+				std::copy(it->second.begin(), it->second.end(), pads);
+				s_inputs.erase(s_inputs.begin(), std::next(it));
+				s_lockstep_vsync = vsync + 1;
+				count_wait();
+				return true;
+			}
+			if (!s_active.load() || VMManager::GetState() == VMState::Stopping)
+				return false;
+			s_inputs_cv.wait_for(lock, std::chrono::milliseconds(2));
+		}
+		count_wait();
 
-		// Work queued for this thread (a stop, a save) still runs while it waits.
-		lock.unlock();
+		// Work queued for this thread (a stop, a save, netplay's) still runs while it waits.
 		Session::RunPendingWork(false);
-		lock.lock();
-		s_inputs_cv.wait_for(lock, std::chrono::milliseconds(2));
+		RunVsyncWork();
+		if (!s_lockstep.on)
+			return false;
 	}
 }
 
 void Session::OnVsync()
 {
 	RunPendingWork(false);
-	ApplyMultitap();
+	RunVsyncWork();
 
 	PadState pads[NUM_PADS];
-	if (s_lockstep.on)
+	// Stopping, unless netplay ended while this vsync waited for its input.
+	if (s_lockstep.on && !LockstepInputs(pads) && s_lockstep.on)
+		return;
+	if (!s_lockstep.on)
 	{
-		const u32 vsync = s_lockstep_vsync++;
-		if (s_lockstep.hash_every != 0 && vsync % s_lockstep.hash_every == 0)
-			SendStateHashes(vsync);
-		if (!WaitForInputs(vsync, pads))
-			return;
-	}
-	else
-	{
+		// In lockstep the multitap changes only as netplay starts, at the same vsync on every PC.
+		ApplyMultitap();
 		std::unique_lock lock(s_pad_mutex);
 		std::copy(s_pads.begin(), s_pads.end(), pads);
 	}
+	const bool force = s_force_pads;
+	s_force_pads = false;
 	for (u32 player = 0; player < NUM_PADS; player++)
 	{
 		// Players 3 and 4 only have a pad with the multitap in.
@@ -923,7 +992,7 @@ void Session::OnVsync()
 			continue;
 		const u32 port = s_multitap_applied ? TAP_PAD_SLOTS[player] : player;
 		const PadState& pad = pads[player];
-		if (pad == s_applied_pads[player])
+		if (!force && pad == s_applied_pads[player])
 			continue;
 
 		for (u32 bind = PadDualshock2::Inputs::PAD_UP; bind < PadDualshock2::Inputs::PAD_L_UP; bind++)
@@ -978,9 +1047,14 @@ void Session::OnVMShuttingDown()
 	s_last_grab_ms = 0.0;
 	s_lockstep = {};
 	s_lockstep_vsync = 0;
+	s_force_pads = false;
 	{
 		std::unique_lock lock(s_pad_mutex);
 		s_inputs.clear();
+	}
+	{
+		std::unique_lock lock(s_work_mutex);
+		s_vsync_work.clear();
 	}
 }
 
@@ -1208,6 +1282,116 @@ static void LoadStateFromPage(std::vector<u8> bytes)
 	Session::SendEvent(ok ? "state-loaded" : "error", ok ? "" : fmt::format("Loading the state failed: {}", error.GetDescription()));
 }
 
+//////////////////////////////////////////////////////////////////////////
+// Netplay (0x0D): CPU thread, at a vsync
+//////////////////////////////////////////////////////////////////////////
+
+static void StartLockstep(u32 vsync, u32 hash_every)
+{
+	s_lockstep = {};
+	s_lockstep.on = true;
+	s_lockstep.hash_every = hash_every;
+	s_lockstep_vsync = vsync;
+	s_force_pads = true;
+	// Input for earlier vsyncs is an earlier session's; this one's may already be here.
+	std::unique_lock lock(s_pad_mutex);
+	s_inputs.erase(s_inputs.begin(), s_inputs.lower_bound(vsync));
+}
+
+static void NetplayHost(bool multitap, u32 vsync, u32 hash_every)
+{
+	s_multitap_wanted.store(multitap);
+	ApplyMultitap();
+	// The guests get the card as the game last wrote it, ahead of the state.
+	if (s_card_dirty)
+		SendMemoryCard();
+
+	const std::string path = TempStatePath();
+	std::string error_text;
+	VMManager::SaveState(path.c_str(), false, false, [&error_text](const std::string& error) { error_text = error; });
+	std::optional<std::vector<u8>> bytes = FileSystem::ReadBinaryFile(path.c_str());
+	if (!bytes.has_value())
+	{
+		Session::SendEvent("error", fmt::format("Saving the state for netplay failed: {}", error_text));
+		return;
+	}
+	u8 header[8] = {MSG_STATE};
+	SendBinary({std::span<const u8>(header), std::span<const u8>(bytes->data(), bytes->size())});
+
+	// This PC goes on from the loaded state too, as the guests do: a load resets what a state doesn't hold, such as
+	// the memory card's eject after a load.
+	Error error;
+	const bool ok = VMManager::LoadState(path.c_str(), &error);
+	FileSystem::DeleteFilePath(path.c_str());
+	if (!ok)
+	{
+		Session::SendEvent("error", fmt::format("Loading the state for netplay failed: {}", error.GetDescription()));
+		return;
+	}
+	StartLockstep(vsync, hash_every);
+	Session::SendEvent("netplay", "host");
+}
+
+static void NetplayJoin(bool multitap, u32 vsync, u32 hash_every, std::vector<u8> state)
+{
+	// Before the load, so the pads it holds land in the same pad slots as on the host.
+	s_multitap_wanted.store(multitap);
+	ApplyMultitap();
+
+	const std::string path = TempStatePath();
+	Error error;
+	const bool ok = FileSystem::WriteBinaryFile(path.c_str(), state.data(), state.size()) &&
+					VMManager::LoadState(path.c_str(), &error);
+	FileSystem::DeleteFilePath(path.c_str());
+	if (!ok)
+	{
+		Session::SendEvent("error", fmt::format("Loading the host's state failed: {}", error.GetDescription()));
+		return;
+	}
+	StartLockstep(vsync, hash_every);
+	Session::SendEvent("netplay", "join");
+}
+
+static void NetplayEnd()
+{
+	s_lockstep = {};
+	s_force_pads = true;
+	{
+		std::unique_lock lock(s_pad_mutex);
+		s_inputs.clear();
+	}
+	Session::SendEvent("netplay", "end");
+}
+
+static void HandleNetplay(std::span<const u8> data)
+{
+	if (data.size() < 12)
+		return;
+
+	const u8 op = data[1];
+	const bool multitap = data[2] != 0;
+	const u32 vsync = ReadValue<u32>(data, 4);
+	const u32 hash_every = ReadValue<u32>(data, 8);
+	std::function<void()> work;
+	if (op == NETPLAY_HOST)
+		work = [multitap, vsync, hash_every]() { NetplayHost(multitap, vsync, hash_every); };
+	else if (op == NETPLAY_JOIN && data.size() > 12)
+		work = [multitap, vsync, hash_every, state = std::vector<u8>(data.begin() + 12, data.end())]() mutable {
+			NetplayJoin(multitap, vsync, hash_every, std::move(state));
+		};
+	else if (op == NETPLAY_END)
+		work = []() { NetplayEnd(); };
+	else
+		return;
+
+	{
+		std::unique_lock lock(s_work_mutex);
+		s_vsync_work.push_back(std::move(work));
+	}
+	// A vsync waiting for its input runs it as it waits.
+	s_inputs_cv.notify_all();
+}
+
 void Session::HandleMessage(std::span<const u8> data, bool is_text)
 {
 	if (is_text || data.empty())
@@ -1277,6 +1461,9 @@ void Session::HandleMessage(std::span<const u8> data, bool is_text)
 			break;
 		case MSG_INPUTS:
 			HandleInputs(data);
+			break;
+		case MSG_NETPLAY:
+			HandleNetplay(data);
 			break;
 		default:
 			break;

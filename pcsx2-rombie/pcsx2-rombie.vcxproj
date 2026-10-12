@@ -47,6 +47,9 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <EntryPointSymbol>wmainCRTStartup</EntryPointSymbol>
+      <!-- PCSX2's windows\Optimus.cpp asks laptops with two GPUs for the fast one; nothing references it, so the
+           linker would leave it out of the library without this. -->
+      <ForceSymbolReferences>NvOptimusEnablement;AmdPowerXpressRequestHighPerformance;%(ForceSymbolReferences)</ForceSymbolReferences>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

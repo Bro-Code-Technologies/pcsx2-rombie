@@ -43,6 +43,7 @@
 #include "pcsx2/CDVD/CDVD.h"
 #include "pcsx2/GS.h"
 #include "pcsx2/GS/GS.h"
+#include "pcsx2/GS/Renderers/Common/GSDevice.h"
 #include "pcsx2/Host.h"
 #include "pcsx2/ImGui/FullscreenUI.h"
 #include "pcsx2/ImGui/ImGuiFullscreen.h"
@@ -59,8 +60,10 @@
 #include "svnrev.h"
 
 #include <ShlObj.h>
+#include <dxgi1_6.h>
+#include <wrl/client.h>
 
-static constexpr int PROTOCOL_VERSION = 2;
+static constexpr int PROTOCOL_VERSION = 3;
 static constexpr u16 ENGINE_PORT = 47652;
 static constexpr const wchar_t* LINK_KEY = L"Software\\Classes\\rombie-ps2";
 static constexpr const wchar_t* PRODUCT_NAME = L"Rombie PS2 Engine";
@@ -215,6 +218,20 @@ static bool InitializeConfig()
 	return true;
 }
 
+/// The GPU Windows calls high-performance, by the name PCSX2 knows adapters by (its description); empty if Windows
+/// can't say.
+static std::string HighPerformanceAdapter()
+{
+	Microsoft::WRL::ComPtr<IDXGIFactory6> factory;
+	Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+	DXGI_ADAPTER_DESC1 desc;
+	if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf()))) ||
+		FAILED(factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(adapter.GetAddressOf()))) ||
+		FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
+		return {};
+	return StringUtil::WideStringToUTF8String(desc.Description);
+}
+
 static void SettingsOverride()
 {
 	MemorySettingsInterface& si = s_settings_interface;
@@ -225,6 +242,10 @@ static void SettingsOverride()
 	si.SetIntValue("EmuCore/GS", "VsyncEnable", false);
 	if (s_renderer.has_value())
 		si.SetIntValue("EmuCore/GS", "Renderer", static_cast<int>(s_renderer.value()));
+	// Laptops with two GPUs list the power-saving one first, and PCSX2 takes the first it's given: the fast one is
+	// what keeps a game at full speed.
+	if (const std::string adapter = HighPerformanceAdapter(); !adapter.empty())
+		si.SetStringValue("EmuCore/GS", "Adapter", adapter.c_str());
 	si.SetBoolValue("EmuCore/GS", "OsdShowMessages", false);
 
 	// Input only ever comes from the page, so a pad can't drive the game twice or skip Rombie's
@@ -654,8 +675,9 @@ static void RunGame(Session::BootRequest& boot)
 		return;
 	}
 
-	Session::SendEvent("booted", fmt::format("serial={} renderer={} lockstep={} title={}", VMManager::GetDiscSerial(),
-									 Pcsx2Config::GSOptions::GetRendererName(GSGetCurrentRenderer()), boot.lockstep.on ? 1 : 0,
+	Session::SendEvent("booted", fmt::format("serial={} renderer={} gpu={} lockstep={} title={}", VMManager::GetDiscSerial(),
+									 Pcsx2Config::GSOptions::GetRendererName(GSGetCurrentRenderer()),
+									 g_gs_device ? g_gs_device->GetName() : std::string("?"), boot.lockstep.on ? 1 : 0,
 									 VMManager::GetTitle(true)));
 
 	if (boot.lockstep.unthrottled)

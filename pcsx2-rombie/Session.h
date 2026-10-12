@@ -34,6 +34,17 @@ class WebSocketServer;
 ///                    memory starts from zeros and VU1 runs on the CPU thread. Unthrottled runs as fast as the input comes, for tests. Every <hash every>
 ///                    vsyncs (0 = never) the engine sends 0x86.)
 ///   0x0C inputs      [u8 type][3 pad][u32 first vsync][u32 count][count x 4 players x (u32 buttons, f32 lx, ly, rx, ry)]
+///   0x0D netplay     [u8 type][u8 op][u8 multitap][u8 pad][u32 vsync][u32 hash every][state bytes, op 2 only]
+///                    (a running game, done at its next vsync and never while paused, so every PC does it at the same
+///                    point of a vsync. Op 1 host: send the memory card if the game changed it (0x85) and the state
+///                    (0x84), then load that state back, as the guests do. Op 2 join: load the state that follows;
+///                    send it once the game has shown a frame (0x82), as a state loaded sooner after boot leaves the
+///                    GS with no picture to send. A state isn't all an engine carries: one that has run the game a
+///                    while can go on differently from it than one just booted, so Rombie boots the host's game again
+///                    and has it join its own state too.
+///                    Both first set the multitap as given, then go into lockstep from <vsync> as 0x0B describes,
+///                    hashing every <hash every> vsyncs; 0x0A waits until lockstep ends. Op 3 end: lockstep off, and
+///                    0x03 pads play again. Each answers with the event "netplay", detail host, join or end.)
 /// Engine to page (binary):
 ///   0x81 disc read   [u8 type][3 pad][u32 request id][u64 offset][u32 length]
 ///   0x82 frame       [u8 type][3 pad][u32 frame no][f64 engine time, ms][u16 w][u16 h][u32 vblank no][RGBA]
@@ -43,7 +54,9 @@ class WebSocketServer;
 ///   0x86 hashes      [u8 type][3 pad][u32 vsync][u32 count][count x u64]   (lockstep: XXH3 of the emulated state at the
 ///                    start of that vsync, before its input: EE RAM, scratchpad, EE registers, FPU registers, IOP RAM,
 ///                    IOP registers, VU0, VU1, EE hardware registers, IOP hardware registers)
-/// Engine to page (text, JSON): hello, event, stats (once a second), pong.
+///   0x87 vsync       [u8 type][3 pad][u32 vsync]                      (lockstep: that vsync is next, and runs once its
+///                                                                      input is in)
+/// Engine to page (text, JSON): hello, event, stats (once a second; "lw" is the ms it waited for lockstep input), pong.
 /// Pad buttons: bit i is PadDualshock2::Inputs value i (PAD_UP .. PAD_PRESSURE). Sticks run -1..1,
 /// with +y down, as in the browser's standard gamepad mapping.
 namespace Session
