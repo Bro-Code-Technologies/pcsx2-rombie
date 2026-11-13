@@ -70,13 +70,16 @@ static constexpr const wchar_t* PRODUCT_NAME = L"Rombie PS2 Engine";
 // The game's card while it plays, written from the copy Rombie keeps and removed when the game stops.
 static constexpr const char* CARD_FILENAME = "rombie-card.ps2";
 
-// The only pages that may drive the engine: Rombie in production, its staging site and its local dev server.
-static constexpr std::array<std::string_view, 4> ALLOWED_ORIGINS = {
+// The only pages that may drive the engine: Rombie in production, its staging site, and Rombie's local servers below.
+static constexpr std::array<std::string_view, 2> ALLOWED_ORIGINS = {
 	"https://rombie.app",
 	"https://staged.rombie.app",
-	"http://localhost:5173",
-	"http://127.0.0.1:5173",
 };
+// Rombie's local port block (brotocol's web-apps profile): its dev server, its preview and the rest of the block, on
+// either local host name.
+static constexpr std::array<std::string_view, 2> DEV_BLOCK_HOSTS = {"http://localhost:", "http://127.0.0.1:"};
+static constexpr int DEV_BLOCK_FIRST_PORT = 10020;
+static constexpr int DEV_BLOCK_LAST_PORT = 10029;
 
 // How long an engine started by a link waits for its page (long enough for the browser's own
 // permission prompts), and how long it stays after the page goes, so a reload can reconnect.
@@ -537,10 +540,29 @@ static HandoffResult HandOffKey(u16 port, const std::string& key)
 	return result;
 }
 
+// Exactly a block host and five digits within the block, with nothing after them.
+static bool IsDevBlockOrigin(std::string_view origin)
+{
+	for (const std::string_view host : DEV_BLOCK_HOSTS)
+	{
+		if (origin.size() != host.size() + 5 || origin.substr(0, host.size()) != host)
+			continue;
+		int port = 0;
+		for (const char ch : origin.substr(host.size()))
+		{
+			if (ch < '0' || ch > '9')
+				return false;
+			port = port * 10 + (ch - '0');
+		}
+		return port >= DEV_BLOCK_FIRST_PORT && port <= DEV_BLOCK_LAST_PORT;
+	}
+	return false;
+}
+
 static bool IsAllowedOrigin(std::string_view origin)
 {
 	return std::find(ALLOWED_ORIGINS.begin(), ALLOWED_ORIGINS.end(), origin) != ALLOWED_ORIGINS.end() ||
-		   (!s_dev_origin.empty() && origin == s_dev_origin);
+		   IsDevBlockOrigin(origin) || (!s_dev_origin.empty() && origin == s_dev_origin);
 }
 
 /// Lockstep (netplay): what could differ between two PCs is pinned for this game, and set back after it.
