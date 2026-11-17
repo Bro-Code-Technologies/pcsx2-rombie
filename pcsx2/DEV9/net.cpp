@@ -60,11 +60,20 @@ void ad_reset()
 		nif->reset();
 }
 
+static std::function<NetAdapter*()> s_custom_adapter_factory;
+
+void SetCustomNetAdapterFactory(std::function<NetAdapter*()> factory)
+{
+	s_custom_adapter_factory = std::move(factory);
+}
+
 NetAdapter* GetNetAdapter()
 {
 	NetAdapter* na = nullptr;
 
-	switch (EmuConfig.DEV9.EthApi)
+	if (s_custom_adapter_factory)
+		na = s_custom_adapter_factory();
+	else switch (EmuConfig.DEV9.EthApi)
 	{
 #ifdef _WIN32
 		case Pcsx2Config::DEV9Options::NetApi::TAP:

@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "Session.h"
+#include "LinkAdapter.h"
 #include "WebSocketServer.h"
 
 #include "pcsx2/PrecompiledHeader.h"
 
 #include "pcsx2/CDVD/IsoFileFormats.h"
 #include "pcsx2/CDVD/ThreadedFileReader.h"
+#include "pcsx2/DEV9/net.h"
 #include "pcsx2/GS/Renderers/Common/GSDevice.h"
 #include "pcsx2/GS/Renderers/Common/GSTexture.h"
 #include "pcsx2/Host.h"
@@ -68,6 +70,7 @@ namespace
 		MSG_LOCKSTEP = 0x0B,
 		MSG_INPUTS = 0x0C,
 		MSG_NETPLAY = 0x0D,
+		MSG_LINK_TO_CONSOLE = 0x11,
 
 		MSG_DISC_READ = 0x81,
 		MSG_FRAME = 0x82,
@@ -96,6 +99,8 @@ namespace
 		CONTROL_PAUSE = 1,
 		CONTROL_RESUME = 2,
 		CONTROL_EXIT = 3,
+		CONTROL_LINK_IN = 5,
+		CONTROL_LINK_OUT = 6,
 	};
 
 	static constexpr u32 FRAME_HEADER_SIZE = 24;
@@ -204,6 +209,8 @@ static std::condition_variable s_inputs_cv;
 static std::map<u32, std::array<PadState, NUM_PADS>> s_inputs;
 static Session::Lockstep s_boot_lockstep; // s_boot_mutex: the 0x0B that came before the boot message
 static Session::Lockstep s_lockstep; // CPU thread: the running game's
+// s_lockstep.on, for the page's thread: System Link's cable stays out in lockstep, where every PC must match.
+static std::atomic<bool> s_lockstep_active{false};
 static u32 s_lockstep_vsync = 0; // CPU thread: the next vsync to run
 // CPU thread: set every pad at the next vsync, whatever was applied last. Netplay starts from a loaded state, whose
 // pads are the host's, not what this PC last applied.
@@ -547,6 +554,10 @@ void Session::InstallHooks()
 	AudioStream::SetCustomStreamFactory(&CreateAudioStream);
 	InputIsoFile::SetCustomReaderFactory(&CreateDiscReader);
 	FileMcd_SetWriteNotifier(&OnCardWritten);
+	// DEV9 makes the adapter on the CPU thread as the VM starts, after BeginGame has set this boot's lockstep.
+	SetCustomNetAdapterFactory([]() {
+		return RombieLink::CreateAdapter(s_lockstep.on, [](std::span<const u8> message) { return SendBinary({message}); });
+	});
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -653,15 +664,18 @@ static std::string TakeStatsJson(double window_ms)
 	const u64 send_us = take(s_stats.send_us);
 	const u64 send_max_us = take(s_stats.send_max_us);
 	const u64 lockstep_wait_us = take(s_stats.lockstep_wait_us);
+	const RombieLink::Counts link = RombieLink::TakeCounts();
 
 	return fmt::format(R"({{"t":"stats","ms":{:.0f},"vbl":{},"grab":{},"sent":{},"drop":{},"w":{},"h":{},)"
 					   R"("rb":{:.2f},"rbMax":{:.2f},"send":{:.2f},"sendMax":{:.2f},"af":{},"au":{},)"
-					   R"("dr":{},"drBytes":{},"drMs":{:.2f},"drMax":{:.2f},"cpu":{:.0f},"gs":{:.0f},"speed":{:.1f},"lw":{:.0f}}})",
+					   R"("dr":{},"drBytes":{},"drMs":{:.2f},"drMax":{:.2f},"cpu":{:.0f},"gs":{:.0f},"speed":{:.1f},"lw":{:.0f},)"
+					   R"("link":[{},{},{},{}]}})",
 		window_ms, vbl, grabbed, sent, dropped, s_stats.width.load(), s_stats.height.load(),
 		grabbed ? rb_us / 1000.0 / grabbed : 0.0, rb_max_us / 1000.0, sent ? send_us / 1000.0 / sent : 0.0,
 		send_max_us / 1000.0, audio, underruns, reads, read_bytes, reads ? read_us / 1000.0 / reads : 0.0,
 		read_max_us / 1000.0, PerformanceMetrics::GetCPUThreadUsage(), PerformanceMetrics::GetGSThreadUsage(),
-		PerformanceMetrics::GetSpeed(), lockstep_wait_us / 1000.0);
+		PerformanceMetrics::GetSpeed(), lockstep_wait_us / 1000.0, link.in_frames, link.in_bytes, link.out_frames,
+		link.out_bytes);
 }
 
 static void SenderThread()
@@ -852,6 +866,9 @@ static void ApplyMultitap()
 void Session::BeginGame(const Lockstep& lockstep)
 {
 	s_lockstep = lockstep;
+	s_lockstep_active.store(lockstep.on);
+	if (lockstep.on)
+		RombieLink::SetCable(false);
 	s_lockstep_vsync = 0;
 	s_force_pads = false;
 	{
@@ -1046,6 +1063,7 @@ void Session::OnVMShuttingDown()
 	s_vblank_no.store(0);
 	s_last_grab_ms = 0.0;
 	s_lockstep = {};
+	s_lockstep_active.store(false);
 	s_lockstep_vsync = 0;
 	s_force_pads = false;
 	{
@@ -1290,6 +1308,8 @@ static void StartLockstep(u32 vsync, u32 hash_every)
 {
 	s_lockstep = {};
 	s_lockstep.on = true;
+	s_lockstep_active.store(true);
+	RombieLink::SetCable(false);
 	s_lockstep.hash_every = hash_every;
 	s_lockstep_vsync = vsync;
 	s_force_pads = true;
@@ -1355,6 +1375,7 @@ static void NetplayJoin(bool multitap, u32 vsync, u32 hash_every, std::vector<u8
 static void NetplayEnd()
 {
 	s_lockstep = {};
+	s_lockstep_active.store(false);
 	s_force_pads = true;
 	{
 		std::unique_lock lock(s_pad_mutex);
@@ -1415,7 +1436,15 @@ void Session::HandleMessage(std::span<const u8> data, bool is_text)
 			HandlePing(data);
 			break;
 		case MSG_CONTROL:
-			if (data.size() >= 2)
+			if (data.size() >= 2 && (data[1] == CONTROL_LINK_IN || data[1] == CONTROL_LINK_OUT))
+			{
+				// The cable, before boot or while the game runs: no VM needed, and never in lockstep.
+				const bool in = data[1] == CONTROL_LINK_IN && !s_lockstep_active.load();
+				RombieLink::SetCable(in);
+				Console.WriteLn("Rombie link: cable %s%s", in ? "in" : "out",
+					data[1] == CONTROL_LINK_IN && !in ? " (refused in lockstep)" : "");
+			}
+			else if (data.size() >= 2)
 			{
 				const u8 op = data[1];
 				QueueOnCPUThread([op]() {
@@ -1464,6 +1493,10 @@ void Session::HandleMessage(std::span<const u8> data, bool is_text)
 			break;
 		case MSG_NETPLAY:
 			HandleNetplay(data);
+			break;
+		case MSG_LINK_TO_CONSOLE:
+			if (data.size() > 4)
+				RombieLink::Deliver(data.subspan(4));
 			break;
 		default:
 			break;

@@ -63,7 +63,8 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
-static constexpr int PROTOCOL_VERSION = 3;
+// 4: System Link (0x11 and 0x89 frames, 0x04 ops 5 and 6 for the cable).
+static constexpr int PROTOCOL_VERSION = 4;
 static constexpr u16 ENGINE_PORT = 47652;
 static constexpr const wchar_t* LINK_KEY = L"Software\\Classes\\rombie-ps2";
 static constexpr const wchar_t* PRODUCT_NAME = L"Rombie PS2 Engine";
@@ -273,6 +274,20 @@ static void SettingsOverride()
 	si.SetStringValue("MemoryCards", "Slot1_Filename", CARD_FILENAME);
 	si.SetBoolValue("MemoryCards", "Slot2_Enable", false);
 	si.SetStringValue("MemoryCards", "Slot2_Filename", "");
+
+	// System Link: the network adapter is in every console, its cable out until the page plugs it in, and joined only
+	// to the page (LinkAdapter.cpp). Its DHCP answers come from the engine, with no gateway and no DNS server, so a
+	// game has nothing to reach beyond the room. No hard disk.
+	si.SetBoolValue("DEV9/Eth", "EthEnable", true);
+	si.SetBoolValue("DEV9/Eth", "InterceptDHCP", true);
+	si.SetBoolValue("DEV9/Eth", "AutoMask", false);
+	si.SetBoolValue("DEV9/Eth", "AutoGateway", false);
+	si.SetStringValue("DEV9/Eth", "Gateway", "0.0.0.0");
+	si.SetStringValue("DEV9/Eth", "ModeDNS1", "Manual");
+	si.SetStringValue("DEV9/Eth", "DNS1", "0.0.0.0");
+	si.SetStringValue("DEV9/Eth", "ModeDNS2", "Manual");
+	si.SetStringValue("DEV9/Eth", "DNS2", "0.0.0.0");
+	si.SetBoolValue("DEV9/Hdd", "HddEnable", false);
 
 	si.SetBoolValue("Achievements", "Enabled", false);
 	si.SetBoolValue("EmuCore", "EnableDiscordPresence", false);

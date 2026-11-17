@@ -19,7 +19,9 @@ class WebSocketServer;
 ///   0x01 boot        [u8 type][3 pad][u32 bios size][u64 disc size][bios bytes][disc name, UTF-8]
 ///   0x02 disc data   [u8 type][3 pad][u32 request id][bytes]          (empty = read failed)
 ///   0x03 pad         [u8 type][u8 player][2 pad][u32 buttons][f32 lx][f32 ly][f32 rx][f32 ry]   (player 0-3)
-///   0x04 control     [u8 type][u8 op]                                 (1 pause, 2 resume, 3 exit)
+///   0x04 control     [u8 type][u8 op]                                 (1 pause, 2 resume, 3 exit; System Link's cable:
+///                                                                      5 in, 6 out, before boot or while the game
+///                                                                      runs, never in lockstep)
 ///   0x05 ping        [u8 type][7 pad][f64 page time, ms]
 ///   0x06 save state  [u8 type]
 ///   0x07 load state  [u8 type][7 pad][state bytes]
@@ -45,6 +47,8 @@ class WebSocketServer;
 ///                    Both first set the multitap as given, then go into lockstep from <vsync> as 0x0B describes,
 ///                    hashing every <hash every> vsyncs; 0x0A waits until lockstep ends. Op 3 end: lockstep off, and
 ///                    0x03 pads play again. Each answers with the event "netplay", detail host, join or end.)
+///   0x11 link frame  [u8 type][3 pad][Ethernet frame]              (System Link: a frame for the console's network
+///                                                                      adapter; dropped with the cable out)
 /// Engine to page (binary):
 ///   0x81 disc read   [u8 type][3 pad][u32 request id][u64 offset][u32 length]
 ///   0x82 frame       [u8 type][3 pad][u32 frame no][f64 engine time, ms][u16 w][u16 h][u32 vblank no][RGBA]
@@ -56,7 +60,10 @@ class WebSocketServer;
 ///                    IOP registers, VU0, VU1, EE hardware registers, IOP hardware registers)
 ///   0x87 vsync       [u8 type][3 pad][u32 vsync]                      (lockstep: that vsync is next, and runs once its
 ///                                                                      input is in)
-/// Engine to page (text, JSON): hello, event, stats (once a second; "lw" is the ms it waited for lockstep input), pong.
+///   0x89 link frame  [u8 type][3 pad][Ethernet frame]              (System Link: a frame the console's network adapter
+///                                                                      sent, with the cable in; LinkAdapter.h)
+/// Engine to page (text, JSON): hello, event, stats (once a second; "lw" is the ms it waited for lockstep input, "link"
+/// the second's frames and bytes to the console, then from it), pong.
 /// Pad buttons: bit i is PadDualshock2::Inputs value i (PAD_UP .. PAD_PRESSURE). Sticks run -1..1,
 /// with +y down, as in the browser's standard gamepad mapping.
 namespace Session

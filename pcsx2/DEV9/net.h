@@ -139,6 +139,10 @@ private:
 	void InternalServerThread();
 };
 
+// Rombie: a frontend can supply its own adapter, which GetNetAdapter() then uses whatever EthApi says. Needs proper
+// testing beyond the Rombie engine.
+void SetCustomNetAdapterFactory(std::function<NetAdapter*()> factory);
+
 void tx_put(NetPacket* ptr);
 void ad_reset();
 
