@@ -64,7 +64,9 @@
 #include <wrl/client.h>
 
 // 4: System Link (0x11 and 0x89 frames, 0x04 ops 5 and 6 for the cable).
-static constexpr int PROTOCOL_VERSION = 4;
+// 5: eight players: 0x0A's and 0x0D's multitap byte counts them (2, one in each port), 0x0C says how many pads a frame
+//    holds, and 0x03 takes players 0-7.
+static constexpr int PROTOCOL_VERSION = 5;
 static constexpr u16 ENGINE_PORT = 47652;
 static constexpr const wchar_t* LINK_KEY = L"Software\\Classes\\rombie-ps2";
 static constexpr const wchar_t* PRODUCT_NAME = L"Rombie PS2 Engine";
@@ -256,9 +258,9 @@ static void SettingsOverride()
 	// controls. None of PCSX2's own input sources are opened.
 	for (u32 i = 0; i < static_cast<u32>(InputSourceType::Count); i++)
 		si.SetBoolValue("InputSources", InputManager::InputSourceToString(static_cast<InputSourceType>(i)), false);
-	// PCSX2 numbers pads 0 and 1 for the two controller ports and 2-4 for a multitap on port 1. Pads
-	// 2-4 only connect while the page has the tap in (Session.cpp); the tap itself starts out.
-	for (u32 slot = 0; slot < 5; slot++)
+	// PCSX2 numbers pads 0 and 1 for the two controller ports, 2-4 for a multitap on port 1 and 5-7 for one on port 2.
+	// Pads 2-7 only connect while the page has the taps in (Session.cpp); the taps themselves start out.
+	for (u32 slot = 0; slot < 8; slot++)
 	{
 		const std::string section = fmt::format("Pad{}", slot + 1);
 		si.SetStringValue(section.c_str(), "Type", "DualShock2");

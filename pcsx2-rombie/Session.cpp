@@ -105,11 +105,15 @@ namespace
 
 	static constexpr u32 FRAME_HEADER_SIZE = 24;
 	static constexpr u32 AUDIO_HEADER_SIZE = 8;
-	/// Players the page can send input for. Without the multitap only the first two have a pad.
-	static constexpr u32 NUM_PADS = 4;
-	/// PCSX2's pad slot for each player with a multitap on controller port 1: 1A, 1B, 1C, 1D. PCSX2
-	/// numbers port 2's first pad 1, so without the tap the players are simply slots 0 and 1.
-	static constexpr u32 TAP_PAD_SLOTS[NUM_PADS] = {0, 2, 3, 4};
+	/// Players the page can send input for: two have a pad with no multitap, four with one in controller port 1, all
+	/// eight with one in each port.
+	static constexpr u32 NUM_PADS = 8;
+	/// PCSX2's pad slot for each player with the multitaps in: port 1's 1A, 1B, 1C, 1D, then port 2's 2A, 2B, 2C, 2D.
+	/// PCSX2 numbers port 2's first pad 1 and its tap's others 5-7, so without a tap the players are simply slots 0
+	/// and 1.
+	static constexpr u32 TAP_PAD_SLOTS[NUM_PADS] = {0, 2, 3, 4, 1, 5, 6, 7};
+	/// One multitap per controller port.
+	static constexpr u8 MAX_MULTITAPS = 2;
 
 	/// A megabyte of card data with its ECC bytes, as PCSX2 stores a PS2 card. Cards are 8, 16 or 32 of these.
 	static constexpr size_t CARD_MB = 1024 * 528 * 2;
@@ -121,7 +125,8 @@ namespace
 	static constexpr float MAX_SPEED = 10.0f;
 	/// One player's input in a 0x0C message: u32 buttons and four f32 axes.
 	static constexpr u32 INPUT_PAD_BYTES = 20;
-	static constexpr u32 INPUT_FRAME_BYTES = INPUT_PAD_BYTES * 4;
+	/// Pads in each frame of a 0x0C message from a page before protocol 5, which sends 0 in their place.
+	static constexpr u32 OLD_INPUT_PADS = 4;
 
 	struct PadState
 	{
@@ -159,6 +164,8 @@ namespace
 		std::atomic<u64> lockstep_wait_us{0};
 		std::atomic<u32> width{0};
 		std::atomic<u32> height{0};
+		/// Per PCSX2 pad slot, the vsyncs it had a button held, as the page's input set it.
+		std::array<std::atomic<u32>, NUM_PADS> pads_held{};
 	};
 } // namespace
 
@@ -215,8 +222,9 @@ static u32 s_lockstep_vsync = 0; // CPU thread: the next vsync to run
 // CPU thread: set every pad at the next vsync, whatever was applied last. Netplay starts from a loaded state, whose
 // pads are the host's, not what this PC last applied.
 static bool s_force_pads = false;
-static std::atomic<bool> s_multitap_wanted{false};
-static bool s_multitap_applied = false; // CPU thread only
+// Multitaps: 0, 1 (controller port 1) or 2 (both ports).
+static std::atomic<u8> s_multitap_wanted{0};
+static u8 s_multitap_applied = 0; // CPU thread only
 
 static std::mutex s_disc_mutex;
 static std::condition_variable s_disc_cv;
@@ -665,17 +673,20 @@ static std::string TakeStatsJson(double window_ms)
 	const u64 send_max_us = take(s_stats.send_max_us);
 	const u64 lockstep_wait_us = take(s_stats.lockstep_wait_us);
 	const RombieLink::Counts link = RombieLink::TakeCounts();
+	std::array<u32, NUM_PADS> pads;
+	for (u32 slot = 0; slot < NUM_PADS; slot++)
+		pads[slot] = take(s_stats.pads_held[slot]);
 
 	return fmt::format(R"({{"t":"stats","ms":{:.0f},"vbl":{},"grab":{},"sent":{},"drop":{},"w":{},"h":{},)"
 					   R"("rb":{:.2f},"rbMax":{:.2f},"send":{:.2f},"sendMax":{:.2f},"af":{},"au":{},)"
 					   R"("dr":{},"drBytes":{},"drMs":{:.2f},"drMax":{:.2f},"cpu":{:.0f},"gs":{:.0f},"speed":{:.1f},"lw":{:.0f},)"
-					   R"("link":[{},{},{},{}]}})",
+					   R"("link":[{},{},{},{}],"pads":[{},{},{},{},{},{},{},{}]}})",
 		window_ms, vbl, grabbed, sent, dropped, s_stats.width.load(), s_stats.height.load(),
 		grabbed ? rb_us / 1000.0 / grabbed : 0.0, rb_max_us / 1000.0, sent ? send_us / 1000.0 / sent : 0.0,
 		send_max_us / 1000.0, audio, underruns, reads, read_bytes, reads ? read_us / 1000.0 / reads : 0.0,
 		read_max_us / 1000.0, PerformanceMetrics::GetCPUThreadUsage(), PerformanceMetrics::GetGSThreadUsage(),
 		PerformanceMetrics::GetSpeed(), lockstep_wait_us / 1000.0, link.in_frames, link.in_bytes, link.out_frames,
-		link.out_bytes);
+		link.out_bytes, pads[0], pads[1], pads[2], pads[3], pads[4], pads[5], pads[6], pads[7]);
 }
 
 static void SenderThread()
@@ -731,7 +742,7 @@ void Session::Begin(WebSocketServer* server)
 		s_pads = {};
 		s_inputs.clear();
 	}
-	s_multitap_wanted.store(false);
+	s_multitap_wanted.store(0);
 	{
 		std::unique_lock lock(s_frame_mutex);
 		s_frame_ready = false;
@@ -842,11 +853,11 @@ void Session::RequestQuit()
 	s_boot_cv.notify_all();
 }
 
-/// Plugs the multitap into controller port 1 or takes it out, as the page last asked. PCSX2 treats it
-/// like a settings change: the pads on the port are re-detected by the game.
+/// Plugs the multitaps in or takes them out, as the page last asked: one in controller port 1, then one in port 2 as
+/// well. PCSX2 treats it like a settings change: the pads on the ports are re-detected by the game.
 static void ApplyMultitap()
 {
-	const bool want = s_multitap_wanted.load();
+	const u8 want = s_multitap_wanted.load();
 	if (want == s_multitap_applied || !VMManager::HasValidVM())
 		return;
 
@@ -858,8 +869,11 @@ static void ApplyMultitap()
 	// PCSX2 reloads EmuConfig from the settings when the game's ELF loads, a few seconds into a boot, so
 	// the tap has to be in the settings too or that reload takes it out again (a page that asked for it
 	// while the screen was still black would get a game with no tap).
-	Host::Internal::GetBaseSettingsLayer()->SetBoolValue("Pad", "MultitapPort1", want);
-	EmuConfig.Pad.MultitapPort0_Enabled = want;
+	Host::Internal::GetBaseSettingsLayer()->SetBoolValue("Pad", "MultitapPort1", want >= 1);
+	// Port 2's tap, for players 5-8: needs proper testing with more games that take it.
+	Host::Internal::GetBaseSettingsLayer()->SetBoolValue("Pad", "MultitapPort2", want >= 2);
+	EmuConfig.Pad.MultitapPort0_Enabled = want >= 1;
+	EmuConfig.Pad.MultitapPort1_Enabled = want >= 2;
 	Pad::LoadConfig(*Host::GetSettingsInterface());
 }
 
@@ -1002,11 +1016,10 @@ void Session::OnVsync()
 	}
 	const bool force = s_force_pads;
 	s_force_pads = false;
-	for (u32 player = 0; player < NUM_PADS; player++)
+	// Players past what the multitaps give have no pad: two with none, four with port 1's, eight with both.
+	const u32 players = s_multitap_applied >= 2 ? NUM_PADS : s_multitap_applied == 1 ? 4 : 2;
+	for (u32 player = 0; player < players; player++)
 	{
-		// Players 3 and 4 only have a pad with the multitap in.
-		if (!s_multitap_applied && player >= 2)
-			continue;
 		const u32 port = s_multitap_applied ? TAP_PAD_SLOTS[player] : player;
 		const PadState& pad = pads[player];
 		if (!force && pad == s_applied_pads[player])
@@ -1025,6 +1038,11 @@ void Session::OnVsync()
 		Pad::SetControllerState(port, PadDualshock2::Inputs::PAD_R_LEFT, std::max(-rx, 0.0f));
 		Pad::SetControllerState(port, PadDualshock2::Inputs::PAD_R_RIGHT, std::max(rx, 0.0f));
 		s_applied_pads[player] = pad;
+	}
+	for (u32 player = 0; player < players; player++)
+	{
+		if (s_applied_pads[player].buttons != 0)
+			s_stats.pads_held[s_multitap_applied ? TAP_PAD_SLOTS[player] : player].fetch_add(1, std::memory_order_relaxed);
 	}
 
 	if (s_card_dirty && NowMs() - s_card_written_ms >= CARD_SETTLE_MS)
@@ -1053,11 +1071,12 @@ void Session::OnVMShuttingDown()
 	});
 	MTGS::WaitGS(false);
 	s_applied_pads = {};
-	// The next boot loads settings with the tap out.
-	s_multitap_applied = false;
+	// The next boot loads settings with the taps out.
+	s_multitap_applied = 0;
 	{
 		std::unique_lock<std::mutex> lock = Host::GetSettingsLock();
 		Host::Internal::GetBaseSettingsLayer()->SetBoolValue("Pad", "MultitapPort1", false);
+		Host::Internal::GetBaseSettingsLayer()->SetBoolValue("Pad", "MultitapPort2", false);
 	}
 	s_frame_no = 0;
 	s_vblank_no.store(0);
@@ -1167,19 +1186,24 @@ static void HandleInputs(std::span<const u8> data)
 	if (data.size() < 12)
 		return;
 
+	// Pads in each frame: as the page says, or four from a page before protocol 5.
+	const u32 per_frame = data[1] == 0 ? OLD_INPUT_PADS : data[1];
+	if (per_frame != OLD_INPUT_PADS && per_frame != NUM_PADS)
+		return;
+	const size_t frame_bytes = static_cast<size_t>(INPUT_PAD_BYTES) * per_frame;
 	const u32 first = ReadValue<u32>(data, 4);
 	const u32 count = ReadValue<u32>(data, 8);
-	if (count == 0 || data.size() < 12 + static_cast<size_t>(count) * INPUT_FRAME_BYTES)
+	if (count == 0 || data.size() < 12 + static_cast<size_t>(count) * frame_bytes)
 		return;
 
 	{
 		std::unique_lock lock(s_pad_mutex);
 		for (u32 frame = 0; frame < count; frame++)
 		{
-			std::array<PadState, NUM_PADS> pads;
-			for (u32 player = 0; player < NUM_PADS; player++)
+			std::array<PadState, NUM_PADS> pads = {};
+			for (u32 player = 0; player < per_frame; player++)
 			{
-				const size_t at = 12 + static_cast<size_t>(frame) * INPUT_FRAME_BYTES + player * INPUT_PAD_BYTES;
+				const size_t at = 12 + static_cast<size_t>(frame) * frame_bytes + player * INPUT_PAD_BYTES;
 				pads[player].buttons = ReadValue<u32>(data, at);
 				for (u32 i = 0; i < 4; i++)
 					pads[player].axes[i] = std::clamp(ReadValue<float>(data, at + 4 + i * 4), -1.0f, 1.0f);
@@ -1257,7 +1281,8 @@ static void HandleMultitap(std::span<const u8> data)
 {
 	if (data.size() < 2)
 		return;
-	s_multitap_wanted.store(data[1] != 0);
+	// An older page's 0 and 1 mean what they meant: no tap, or port 1's.
+	s_multitap_wanted.store(std::min(data[1], MAX_MULTITAPS));
 }
 
 static void HandlePing(std::span<const u8> data)
@@ -1313,14 +1338,23 @@ static void StartLockstep(u32 vsync, u32 hash_every)
 	s_lockstep.hash_every = hash_every;
 	s_lockstep_vsync = vsync;
 	s_force_pads = true;
+	// Every pad starts lockstep plugged in. PCSX2 has a pad it makes for a multitap going in answer as unplugged for its
+	// first polls (ejectTicks), which no state holds, and each PC put its multitaps in at its own moment: the host's
+	// rebooted engine at its first vsync, keeping its page's ask, and a guest's as it joined. The first press on port
+	// 2's pads then went differently on two PCs. Needs proper testing with more games.
+	for (u32 slot = 0; slot < NUM_PADS; slot++)
+	{
+		if (PadBase* pad = Pad::GetPad(static_cast<u8>(slot)))
+			pad->ejectTicks = 0;
+	}
 	// Input for earlier vsyncs is an earlier session's; this one's may already be here.
 	std::unique_lock lock(s_pad_mutex);
 	s_inputs.erase(s_inputs.begin(), s_inputs.lower_bound(vsync));
 }
 
-static void NetplayHost(bool multitap, u32 vsync, u32 hash_every)
+static void NetplayHost(u8 multitaps, u32 vsync, u32 hash_every)
 {
-	s_multitap_wanted.store(multitap);
+	s_multitap_wanted.store(multitaps);
 	ApplyMultitap();
 	// The guests get the card as the game last wrote it, ahead of the state.
 	if (s_card_dirty)
@@ -1352,10 +1386,10 @@ static void NetplayHost(bool multitap, u32 vsync, u32 hash_every)
 	Session::SendEvent("netplay", "host");
 }
 
-static void NetplayJoin(bool multitap, u32 vsync, u32 hash_every, std::vector<u8> state)
+static void NetplayJoin(u8 multitaps, u32 vsync, u32 hash_every, std::vector<u8> state)
 {
 	// Before the load, so the pads it holds land in the same pad slots as on the host.
-	s_multitap_wanted.store(multitap);
+	s_multitap_wanted.store(multitaps);
 	ApplyMultitap();
 
 	const std::string path = TempStatePath();
@@ -1390,15 +1424,15 @@ static void HandleNetplay(std::span<const u8> data)
 		return;
 
 	const u8 op = data[1];
-	const bool multitap = data[2] != 0;
+	const u8 multitaps = std::min(data[2], MAX_MULTITAPS);
 	const u32 vsync = ReadValue<u32>(data, 4);
 	const u32 hash_every = ReadValue<u32>(data, 8);
 	std::function<void()> work;
 	if (op == NETPLAY_HOST)
-		work = [multitap, vsync, hash_every]() { NetplayHost(multitap, vsync, hash_every); };
+		work = [multitaps, vsync, hash_every]() { NetplayHost(multitaps, vsync, hash_every); };
 	else if (op == NETPLAY_JOIN && data.size() > 12)
-		work = [multitap, vsync, hash_every, state = std::vector<u8>(data.begin() + 12, data.end())]() mutable {
-			NetplayJoin(multitap, vsync, hash_every, std::move(state));
+		work = [multitaps, vsync, hash_every, state = std::vector<u8>(data.begin() + 12, data.end())]() mutable {
+			NetplayJoin(multitaps, vsync, hash_every, std::move(state));
 		};
 	else if (op == NETPLAY_END)
 		work = []() { NetplayEnd(); };

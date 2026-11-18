@@ -18,7 +18,7 @@ class WebSocketServer;
 /// Every multi-byte value is little-endian. Page to engine (binary, first byte is the type):
 ///   0x01 boot        [u8 type][3 pad][u32 bios size][u64 disc size][bios bytes][disc name, UTF-8]
 ///   0x02 disc data   [u8 type][3 pad][u32 request id][bytes]          (empty = read failed)
-///   0x03 pad         [u8 type][u8 player][2 pad][u32 buttons][f32 lx][f32 ly][f32 rx][f32 ry]   (player 0-3)
+///   0x03 pad         [u8 type][u8 player][2 pad][u32 buttons][f32 lx][f32 ly][f32 rx][f32 ry]   (player 0-7)
 ///   0x04 control     [u8 type][u8 op]                                 (1 pause, 2 resume, 3 exit; System Link's cable:
 ///                                                                      5 in, 6 out, before boot or while the game
 ///                                                                      runs, never in lockstep)
@@ -27,16 +27,19 @@ class WebSocketServer;
 ///   0x07 load state  [u8 type][7 pad][state bytes]
 ///   0x08 memory card [u8 type][7 pad][card bytes]                     (before boot; empty = a new card)
 ///   0x09 speed       [u8 type][3 pad][f32 ratio]                      (1 = normal; more = fast-forward)
-///   0x0A multitap    [u8 type][u8 on]                                 (a multitap in controller port 1: players 1-4 are its
-///                                                                      pads; off, players 1 and 2 are ports 1 and 2; every session starts off)
+///   0x0A multitap    [u8 type][u8 multitaps]                          (1, one in controller port 1: players 1-4 are its
+///                                                                      pads; 2, one in each port: players 5-8 are port 2's
+///                                                                      (protocol 5); 0, players 1 and 2 are ports 1 and 2;
+///                                                                      every session starts with none)
 ///   0x0B lockstep    [u8 type][u8 flags][2 pad][u32 hash every][u16 year][u8 month][u8 day][u8 hour][u8 minute][u8 second][u8 pad]
 ///                    (before boot. flags: 1 on, 2 unthrottled. On, vsync N runs only once the page has sent frame N's
 ///                    input with 0x0C, pad messages are ignored, and what could differ between two PCs is pinned: the
 ///                    console's clock is the one given, the BIOS settings (NVRAM) start from PCSX2's defaults, VU
 ///                    memory starts from zeros and VU1 runs on the CPU thread. Unthrottled runs as fast as the input comes, for tests. Every <hash every>
 ///                    vsyncs (0 = never) the engine sends 0x86.)
-///   0x0C inputs      [u8 type][3 pad][u32 first vsync][u32 count][count x 4 players x (u32 buttons, f32 lx, ly, rx, ry)]
-///   0x0D netplay     [u8 type][u8 op][u8 multitap][u8 pad][u32 vsync][u32 hash every][state bytes, op 2 only]
+///   0x0C inputs      [u8 type][u8 pads][2 pad][u32 first vsync][u32 count][count x <pads> players x (u32 buttons, f32 lx, ly, rx, ry)]
+///                    (pads: 4 or 8 a frame (protocol 5); 0, from an older page, is 4)
+///   0x0D netplay     [u8 type][u8 op][u8 multitaps][u8 pad][u32 vsync][u32 hash every][state bytes, op 2 only]
 ///                    (a running game, done at its next vsync and never while paused, so every PC does it at the same
 ///                    point of a vsync. Op 1 host: send the memory card if the game changed it (0x85) and the state
 ///                    (0x84), then load that state back, as the guests do. Op 2 join: load the state that follows;
@@ -44,8 +47,8 @@ class WebSocketServer;
 ///                    GS with no picture to send. A state isn't all an engine carries: one that has run the game a
 ///                    while can go on differently from it than one just booted, so Rombie boots the host's game again
 ///                    and has it join its own state too.
-///                    Both first set the multitap as given, then go into lockstep from <vsync> as 0x0B describes,
-///                    hashing every <hash every> vsyncs; 0x0A waits until lockstep ends. Op 3 end: lockstep off, and
+///                    Both first set the multitaps as given (counted as 0x0A counts them), then go into lockstep from
+///                    <vsync> as 0x0B describes, hashing every <hash every> vsyncs; 0x0A waits until lockstep ends. Op 3 end: lockstep off, and
 ///                    0x03 pads play again. Each answers with the event "netplay", detail host, join or end.)
 ///   0x11 link frame  [u8 type][3 pad][Ethernet frame]              (System Link: a frame for the console's network
 ///                                                                      adapter; dropped with the cable out)
